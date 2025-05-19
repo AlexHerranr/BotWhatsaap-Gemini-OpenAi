@@ -58,6 +58,12 @@ The bot is configured in the `src/app.ts` file. It uses the BuilderBot library t
 
 For more detailed information on how to use and extend this bot, please refer to the [BuilderBot documentation](https://builderbot.vercel.app/).
 
+## Next steps
+
+Explore the power of Firebase Studio to visualize and manage your bot's interactions.
+
+- Learn more in the [Firebase Studio documentation](https://firebase.google.com/docs/studio)
+- Get started with [Firebase Studio](https://studio.firebase.google.com/)
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
