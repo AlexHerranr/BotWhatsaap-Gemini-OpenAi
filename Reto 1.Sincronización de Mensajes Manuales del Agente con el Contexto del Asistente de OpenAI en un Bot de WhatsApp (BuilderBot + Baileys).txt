@@ -1,0 +1,3225 @@
+Reto Principal 1 : Sincronización de Mensajes Manuales del Agente con el Contexto del Asistente de OpenAI en un Bot de WhatsApp (BuilderBot + Baileys)
+
+Contexto del Bot:
+
+Stack: Node.js con TypeScript.
+Framework del Bot: @builderbot/bot.
+Proveedor de WhatsApp: @builderbot/provider-baileys (usa Baileys).
+IA Conversacional: Asistente de OpenAI (@builderbot-plugins/openai-assistants que usa la API de Assistants, Threads, Runs y Messages).
+Base de Datos de Estado: @builderbot/bot MemoryDB.
+Flujo Principal: Los mensajes entrantes de clientes (EVENTS.WELCOME) son manejados por un flujo (mainFlow). Se implementó una lógica para agrupar mensajes rápidos de un mismo cliente (espera X segundos de inactividad antes de procesar el conjunto).
+Procesamiento Secuencial: Un sistema de cola (userQueues) y bloqueo (userLocks) por usuario asegura que las interacciones con el Asistente de OpenAI para un mismo cliente sean secuenciales, utilizando un cooldown (OPENAI_COOLDOWN_MS) entre ellas para evitar errores de "run activo" de OpenAI.
+El Reto Específico:
+
+Cuando un agente humano (el "encargado") responde manualmente a un cliente utilizando la misma cuenta de WhatsApp del bot (por ejemplo, a través de WhatsApp Web o la app móvil), esos mensajes manuales del agente no se reflejan automáticamente en el historial del "Thread" del Asistente de OpenAI para ese cliente.
+
+Esto causa problemas de contexto:
+
+El agente envía manualmente información crucial al cliente (ej: "El precio especial para ti es $100").
+El cliente responde a ese mensaje manual (ej: "¡Perfecto! Lo tomo").
+Este mensaje del cliente llega al bot.
+El bot lo pasa al Asistente de OpenAI.
+El Asistente de OpenAI no tiene idea del mensaje manual del agente, por lo que la respuesta del cliente ("¡Perfecto! Lo tomo") le parece descontextualizada o referida a una interacción anterior del bot, llevando a respuestas incorrectas o confusas.
+Objetivo Deseado: Que los mensajes enviados manualmente por el agente al cliente, desde la misma cuenta de WhatsApp, se "sincronicen" o se añadan al Thread de OpenAI correspondiente a ese cliente, para que el Asistente tenga el contexto completo de la conversación.
+
+Intentos Realizados y Observaciones:
+
+Intento Inicial (Fallido) de Captura en mainFlow:
+
+Se observó que, en una configuración anterior muy básica, los mensajes manuales del agente (key.fromMe === true) llegaban a activar el flujo principal del bot (EVENTS.WELCOME). Sin embargo, esto causaba que el bot se respondiera a sí mismo, ya que no se distinguía correctamente si el mensaje fromMe: true era del propio bot (programático) o del agente manual.
+En la versión actual del código, mainFlow (asociado a EVENTS.WELCOME) parece estar procesando principalmente (o únicamente) mensajes con key.fromMe === false (mensajes entrantes de clientes). Se añadió una guarda explícita if (ctx.key.fromMe) return; en mainFlow para asegurar esto y evitar bucles si EVENTS.WELCOME llegara a activarse por mensajes fromMe:true.
+Intento Actual: Listener Directo de Eventos Baileys ('messages.upsert')
+
+Lógica: Se añadió un listener directamente al emisor de eventos del proveedor Baileys (provider.vendor.ev.on('messages.upsert', ...)) dentro de la función main, después de que createBot inicializa el proveedor y este establece la conexión (connection === 'open').
+Identificación del Mensaje del Agente:
+Se filtra por mensajes con msg.key.fromMe === true.
+Se requiere que el agente humano utilice un prefijo especial (ej: ENCARGADO_SYNC_PREFIX = "[SYNC]") al inicio de sus mensajes manuales para que el bot los identifique como mensajes a sincronizar.
+Pero esto no ha funcionado ni co prefijo [SYNC]
+Proceso de Sincronización (Teórico):
+Si se detecta un mensaje fromMe: true con el prefijo:
+Se extrae el JID del cliente (destinatario msg.key.remoteJid).
+Se extrae el contenido del mensaje (sin el prefijo).
+Se intenta obtener el thread_id de OpenAI para ese cliente desde adapterDB.get(clienteJid), asumiendo que el plugin @builderbot-plugins/openai-assistants lo almacena en el estado del cliente bajo una clave conocida (ej: OPENAI_THREAD_ID_KEY = 'thread_id').
+Se utiliza el SDK de OpenAI (openai.beta.threads.messages.create(threadId, { role: 'assistant', content: ... })) para añadir este mensaje del agente al Thread del cliente.
+Estado Actual del Intento (Según el último log):
+El log [WARN] [MAIN_INIT]: adapterProvider.vendor.ev no disponible o SDK de OpenAI no inicializado. No se puede suscribir a 'messages.upsert'. apareció.
+Esto se corrigió esperando el evento 'connection.update' con connection === 'open' antes de adjuntar el listener de 'messages.upsert', y utilizando la instancia provider devuelta por createBot. Este punto (la correcta suscripción) debería estar resuelto con el último código proporcionado.
+El reto principal ahora es asegurar que el listener 'messages.upsert' efectivamente capture los mensajes del agente y pueda realizar la sincronización con el Thread de OpenAI. La efectividad de esto depende de:
+Que el agente use el prefijo consistentemente.
+Que podamos recuperar correctamente el thread_id del cliente desde adapterDB (es decir, que sepamos la clave correcta y que el estado esté accesible y poblado).
+Que el SDK de OpenAI esté correctamente inicializado con la OPENAI_API_KEY.
+Puntos Adicionales Implementados (Relacionados pero no el foco principal del reto actual):
+
+Agrupación de Mensajes del Cliente: Los mensajes de clientes (fromMe: false) que llegan en ráfagas rápidas se agrupan usando un temporizador de inactividad (USER_INACTIVITY_TIMEOUT_MS, actualmente en 6 segundos) antes de ser enviados a OpenAI. Esto funciona bien.
+Contexto para el Asistente sobre Intervención Manual: Si el bot indica que "un encargado responderá", establece un flag en el estado del cliente (esperando_respuesta_encargado). Cuando el cliente vuelve a escribir, se añade una nota al prompt enviado a OpenAI para que considere que pudo haber una conversación manual intermedia. Esto es un paliativo si la sincronización directa del mensaje del agente falla.
+Básicamente, el desafío es cómo hacer que el bot "escuche" y "registre" de forma fiable los mensajes que un humano envía desde la misma cuenta de WhatsApp, para que la IA conversacional (Asistente de OpenAI) mantenga un contexto completo. El método actual se basa en un listener de bajo nivel de Baileys y un prefijo en los mensajes del agente.
+
+código actual
+
+import "dotenv/config"
+import OpenAI from 'openai'; // Para interactuar directamente con API de OpenAI
+import { createBot, createProvider, createFlow, addKeyword, EVENTS } from '@builderbot/bot'
+import { MemoryDB } from '@builderbot/bot'
+import { BaileysProvider } from '@builderbot/provider-baileys'
+import { toAsk, httpInject } from "@builderbot-plugins/openai-assistants"
+
+// --- Constantes ---
+const PORT = process.env.PORT ?? 3008;
+const ASSISTANT_ID = process.env.ASSISTANT_ID ?? '';
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY ?? ''; // Necesaria para el SDK
+
+const CHUNK_DELAY_MS = 150;
+const OPENAI_COOLDOWN_MS = 3000;
+const CLEAN_REGEX = /【.*?】[ ]?/g;
+const USER_INACTIVITY_TIMEOUT_MS = 6000; // Ajustado a 6 segundos
+const ENCARGADO_SYNC_PREFIX = "[SYNC]";
+const OPENAI_THREAD_ID_KEY = 'thread_id'; // Clave para el thread_id en el state (confirmar si es esta)
+
+// --- SDK de OpenAI ---
+let openai: OpenAI;
+if (OPENAI_API_KEY) {
+    openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+} else {
+    // Este console.error se mostrará antes que los customLog si OPENAI_API_KEY falta al inicio
+    console.error("CRITICAL_ENV_ERROR: OPENAI_API_KEY no está configurada en el archivo .env. La funcionalidad de sincronización de mensajes de encargado y OpenAI no operará.");
+    // Considerar salir si es crítico: process.exit(1);
+}
+
+// --- Almacenamiento para colas y bloqueos ---
+const userQueues = new Map<string, Array<any>>();
+const userLocks = new Map<string, boolean>();
+
+interface UserMessageBuffer {
+    messages: string[];
+    lastCtx: any;
+    flowDynamic: any;
+    state: any; 
+    provider: any;
+}
+const userMessageBuffers = new Map<string, UserMessageBuffer>();
+const userActivityTimers = new Map<string, NodeJS.Timeout>();
+
+// --- Funciones de Logging Personalizadas ---
+const getFormattedTimestamp = (): string => {
+    const now = new Date();
+    const dateOptions: Intl.DateTimeFormatOptions = { year: '2-digit', month: '2-digit', day: '2-digit' };
+    const timeOptions: Intl.DateTimeFormatOptions = { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false };
+    const date = now.toLocaleDateString('es-CO', dateOptions);
+    const time = now.toLocaleTimeString('es-CO', timeOptions);
+    const ms = String(now.getMilliseconds()).padStart(3, '0');
+    return `${date} ${time}.${ms}`;
+};
+
+const customLog = (level: 'INFO' | 'WARN' | 'ERROR' | 'DEBUG', context: string, ...messages: any[]) => {
+    const timestamp = getFormattedTimestamp();
+    const messageParts = messages.map(msg => {
+        if (msg instanceof Error) return msg.stack || msg.message;
+        if (typeof msg === 'object' && msg !== null) {
+            try { return JSON.stringify(msg, null, 2); } catch (e) { return '[Objeto no serializable]'; }
+        }
+        return String(msg);
+    });
+    const logLine = `[${timestamp}] [${level}] ${context}: ${messageParts.join(' ')}`;
+    switch (level) {
+        case 'INFO': console.log(logLine); break;
+        case 'WARN': console.warn(logLine); break;
+        case 'ERROR': console.error(logLine); break;
+        case 'DEBUG': console.debug(logLine); break; // Añadido para logs de depuración
+    }
+};
+
+// --- Funciones de Ayuda ---
+const getShortUserId = (ctxOrUserId: any): string => {
+    if (typeof ctxOrUserId === 'string') return ctxOrUserId.split('@')[0] || ctxOrUserId;
+    return ctxOrUserId?.from?.split('@')[0] || ctxOrUserId?.from || ctxOrUserId?.key?.remoteJid?.split('@')[0] || 'unknownUser';
+};
+
+const extractTextFromMessage = (msg: any): string | null => {
+    if (!msg || !msg.message) return null;
+    return msg.message.conversation ||
+           msg.message.extendedTextMessage?.text ||
+           msg.message.ephemeralMessage?.message?.extendedTextMessage?.text ||
+           msg.message.ephemeralMessage?.message?.conversation ||
+           null;
+};
+
+// --- Función de Typing ---
+const typing = async (ctx: any, provider: any): Promise<void> => {
+    const remoteJid = ctx.key?.remoteJid;
+    const shortUserId = getShortUserId(ctx.from || ctx.key.remoteJid); // ctx.from para entrantes, ctx.key.remoteJid para salientes
+    const logContext = `TYPING [${shortUserId}]`;
+
+    if (provider?.vendor?.sendPresenceUpdate && typeof provider.vendor.sendPresenceUpdate === 'function') {
+        if (remoteJid) {
+            try {
+                await provider.vendor.sendPresenceUpdate('composing', remoteJid);
+            } catch (e) {
+                customLog('ERROR', logContext, `Error al enviar 'composing':`, e);
+            }
+        } else {
+            // No siempre es un error, podría ser un mensaje sin remoteJid claro en ese contexto.
+            // customLog('WARN', logContext, `ctx.key.remoteJid no disponible.`);
+        }
+    }
+};
+
+/**
+ * Procesa el mensaje del usuario interactuando con OpenAI y enviando la respuesta.
+ */
+const processUserMessage = async (ctx: any, { flowDynamic, state, provider }: any) => {
+    const shortUserId = getShortUserId(ctx.from);
+    const logContext = `PROCESS_MSG [${shortUserId}]`;
+    let mensajeParaOpenAI = ctx.body;
+
+    const esperandoEncargado = await state.get('esperando_respuesta_encargado');
+    if (esperandoEncargado) {
+        const temaConsulta = await state.get('tema_consulta_encargado') || 'un tema previo';
+        const notaContextual = `[Nota para el Asistente: El usuario podría estar respondiendo a información proporcionada manualmente por un encargado sobre "${temaConsulta}". Por favor, ten esto en cuenta al generar tu respuesta.]\n\n`;
+        mensajeParaOpenAI = notaContextual + ctx.body;
+        customLog('INFO', logContext, `Añadiendo nota contextual para OpenAI sobre "${temaConsulta}".`);
+        await state.update({ esperando_respuesta_encargado: false, tema_consulta_encargado: null });
+    }
+
+    customLog('INFO', logContext, `Iniciando procesamiento OpenAI para: "${mensajeParaOpenAI.substring(0,100)}..."`);
+    await typing(ctx, provider);
+
+    customLog('INFO', logContext, `Solicitando respuesta a OpenAI Assistant (${ASSISTANT_ID.substring(0,10)})...`);
+    const response = await toAsk(ASSISTANT_ID, mensajeParaOpenAI, state);
+    customLog('INFO', logContext, `Respuesta de OpenAI recibida: "${response.substring(0,50)}..."`);
+
+    const chunks = response.split(/\n\n+/);
+    for (const chunk of chunks) {
+        const cleanedChunk = chunk.trim().replace(CLEAN_REGEX, "");
+        if (cleanedChunk) {
+            customLog('INFO', logContext, `Enviando chunk: "${cleanedChunk.substring(0, 50)}..."`);
+            await flowDynamic([{ body: cleanedChunk }]);
+            
+            if (cleanedChunk.toLowerCase().includes("espere, me comunico con el encargado") || 
+                cleanedChunk.toLowerCase().includes("confirmo con encargado") ||
+                cleanedChunk.toLowerCase().includes("confirmo los precios en el sistema y le aviso")) {
+                let tema = "información general";
+                const originalUserQuery = ctx.body; 
+                if (originalUserQuery.toLowerCase().includes("precio")) tema = "precios";
+                if (originalUserQuery.toLowerCase().includes("disponibilidad")) tema = "disponibilidad";
+                if (originalUserQuery.toLowerCase().includes("ubicado") || originalUserQuery.toLowerCase().includes("distancia")) tema = "ubicación";
+                
+                await state.update({ esperando_respuesta_encargado: true, tema_consulta_encargado: tema });
+                customLog('INFO', logContext, `Bot indicó comunicación con encargado sobre tema "${tema}". Estado 'esperando_respuesta_encargado' activado para ${shortUserId}.`);
+            }
+            await new Promise(resolve => setTimeout(resolve, CHUNK_DELAY_MS));
+        }
+    }
+    customLog('INFO', logContext, `Todos los chunks enviados para el mensaje original del cliente: "${ctx.body.substring(0,30)}..."`);
+};
+
+// --- Manejo de Cola (handleQueue) ---
+const handleQueue = async (userId: string) => {
+    const queue = userQueues.get(userId);
+    const shortUserId = getShortUserId(userId);
+    const logContext = `HANDLE_QUEUE [${shortUserId}]`;
+
+    if (!queue) {
+        customLog('INFO', logContext, `No se encontró cola.`);
+        userLocks.delete(userId);
+        return;
+    }
+    
+    if (userLocks.get(userId)) {
+        customLog('INFO', logContext, `La cola está bloqueada.`);
+        return;
+    }
+
+    while (queue.length > 0) {
+        if (userLocks.get(userId)) {
+            customLog('INFO', logContext, `Bloqueo activado en bucle.`);
+            return;
+        }
+        userLocks.set(userId, true);
+        customLog('INFO', logContext, `Bloqueo adquirido.`);
+        const task = queue.shift();
+
+        if (task) {
+            const { ctx, flowDynamic, state, provider } = task; 
+            customLog('INFO', logContext, `Procesando tarea. Restantes: ${queue.length}. Msg: "${String(ctx.body).substring(0,100)}..."`);
+            try {
+                await processUserMessage(ctx, { flowDynamic, state, provider });
+                customLog('INFO', logContext, `Tarea completada.`);
+            } catch (error: any) {
+                const errorMessage = error.message || String(error);
+                customLog('ERROR', logContext, `Error en tarea para msg "${String(ctx.body).substring(0,30)}...":`, error);
+                if (errorMessage.includes("while a run") && errorMessage.includes("is active")) {
+                    customLog('ERROR', logContext, `OpenAI Run activo. Cooldown actual: ${OPENAI_COOLDOWN_MS}ms.`);
+                }
+            } finally {
+                userLocks.set(userId, false);
+                customLog('INFO', logContext, `Bloqueo liberado.`);
+                if (queue.length > 0) {
+                    customLog('INFO', logContext, `${queue.length} en cola. Cooldown ${OPENAI_COOLDOWN_MS}ms.`);
+                    await new Promise(resolve => setTimeout(resolve, OPENAI_COOLDOWN_MS));
+                }
+            }
+        } else {
+            userLocks.set(userId, false);
+            customLog('WARN', logContext, `Bloqueo liberado (tarea nula).`);
+            break; 
+        }
+    }
+
+    if (queue.length === 0 && !userLocks.get(userId)) {
+        userQueues.delete(userId);
+        userLocks.delete(userId);
+        customLog('INFO', logContext, `Cola vacía y desbloqueada. Limpiada.`);
+    } else if (queue.length === 0 && userLocks.get(userId)) {
+        customLog('WARN', logContext, `Cola vacía pero aún bloqueada.`);
+    } else if (queue.length > 0 && !userLocks.get(userId)) {
+        customLog('INFO', logContext, `${queue.length} en cola y desbloqueada. Siguiente handleQueue lo tomará.`);
+    }
+};
+
+// --- Flujo Principal ---
+const mainFlow = addKeyword<BaileysProvider, MemoryDB>(EVENTS.WELCOME)
+    .addAction(async (ctx, args) => {
+        if (ctx.key.fromMe) {
+            // customLog('DEBUG', `MAIN_FLOW [from:${getShortUserId(ctx.from)}]`, `Mensaje 'fromMe:true' detectado en mainFlow (EVENTS.WELCOME). Ignorando, ya que debe ser manejado por 'messages.upsert' si es del encargado, o es un eco del propio bot.`);
+            return;
+        }
+
+        const { flowDynamic, state, provider } = args;
+        const clientId = ctx.from;
+        const shortClientId = getShortUserId(clientId);
+        const currentMessageBody = ctx.body;
+        const logContextClient = `CLIENT_MSG_HANDLER [from:${shortClientId}]`;
+
+        customLog('INFO', logContextClient, `Mensaje de cliente "${currentMessageBody.substring(0,30)}..." recibido.`);
+
+        let userBuffer = userMessageBuffers.get(clientId);
+        if (!userBuffer) {
+            userBuffer = { messages: [], lastCtx: ctx, flowDynamic, state, provider };
+            userMessageBuffers.set(clientId, userBuffer);
+            customLog('INFO', logContextClient, `Nuevo buffer de mensajes creado para cliente.`);
+        }
+        
+        userBuffer.messages.push(currentMessageBody);
+        userBuffer.lastCtx = ctx;
+        userBuffer.flowDynamic = flowDynamic;
+        userBuffer.state = state; 
+        userBuffer.provider = provider;
+
+        customLog('INFO', logContextClient, `Mensaje añadido al buffer del cliente. Total en buffer: ${userBuffer.messages.length}.`);
+
+        if (userActivityTimers.has(clientId)) {
+            clearTimeout(userActivityTimers.get(clientId)!);
+        }
+
+        const timerId = setTimeout(async () => {
+            const finalBuffer = userMessageBuffers.get(clientId);
+            if (finalBuffer && finalBuffer.messages.length > 0) {
+                const combinedMessageBody = finalBuffer.messages.join('\n\n');
+                const taskCtx = { ...finalBuffer.lastCtx, body: combinedMessageBody };
+                const taskState = finalBuffer.state;
+
+                if (!userQueues.has(clientId)) {
+                    userQueues.set(clientId, []);
+                }
+                const queue = userQueues.get(clientId)!;
+                queue.push({ 
+                    ctx: taskCtx, 
+                    flowDynamic: finalBuffer.flowDynamic, 
+                    state: taskState, 
+                    provider: finalBuffer.provider 
+                });
+                customLog('INFO', `USER_ACTIVITY_TIMEOUT [from:${shortClientId}]`, `${finalBuffer.messages.length} msgs combinados y encolados: "${combinedMessageBody.substring(0,100)}..."`);
+
+                if (!userLocks.get(clientId)) {
+                    customLog('INFO', `USER_ACTIVITY_TIMEOUT [from:${shortClientId}]`, `Cola principal no bloqueada. Iniciando handleQueue.`);
+                    handleQueue(clientId);
+                } else {
+                    customLog('INFO', `USER_ACTIVITY_TIMEOUT [from:${shortClientId}]`, `Cola principal bloqueada. Msg combinado esperará.`);
+                }
+            }
+            userMessageBuffers.delete(clientId);
+            userActivityTimers.delete(clientId);
+        }, USER_INACTIVITY_TIMEOUT_MS);
+
+        userActivityTimers.set(clientId, timerId);
+        customLog('INFO', logContextClient, `Temporizador de inactividad (${USER_INACTIVITY_TIMEOUT_MS / 1000}s) iniciado/reiniciado para cliente.`);
+    });
+
+// --- Función Principal (main) ---
+const main = async () => {
+    const logContext = `[MAIN_INIT]`;
+    customLog('INFO', logContext, `Iniciando el bot en el puerto ${PORT}`);
+    if (!ASSISTANT_ID) {
+        customLog('ERROR', logContext, `CRITICAL: La variable de entorno ASSISTANT_ID no está configurada. Saliendo.`);
+        process.exit(1);
+    }
+    if (!OPENAI_API_KEY || !openai) { // Chequeo si el SDK de OpenAI se pudo inicializar
+        customLog('ERROR', logContext, `CRITICAL: OPENAI_API_KEY no configurada o SDK de OpenAI no inicializado. Sincronización de encargado no funcionará. Saliendo.`);
+        process.exit(1); // Salir si es crítico
+    }
+    customLog('INFO', logContext, `Usando Assistant ID: ${ASSISTANT_ID.substring(0,10)}...`);
+    customLog('INFO', logContext, `OpenAI Cooldown: ${OPENAI_COOLDOWN_MS}ms.`);
+    customLog('INFO', logContext, `User Inactivity Timeout (Msg Grouping): ${USER_INACTIVITY_TIMEOUT_MS}ms.`);
+    customLog('INFO', logContext, `Encargado Sync Prefix: "${ENCARGADO_SYNC_PREFIX}"`);
+
+    const adapterFlow = createFlow([mainFlow]);
+    const baseAdapterProvider = createProvider(BaileysProvider, { groupsIgnore: true, readStatus: false });
+    const adapterDB = new MemoryDB(); 
+
+    const { httpServer, provider } = await createBot({
+        flow: adapterFlow,
+        provider: baseAdapterProvider,
+        database: adapterDB,
+    });
+
+    // Listener para 'messages.upsert' usando la instancia 'provider' de createBot
+    if (provider?.vendor?.ev && openai) {
+        customLog('INFO', logContext, "Preparando suscripción a 'connection.update' del proveedor Baileys.");
+        
+        provider.vendor.ev.on('connection.update', async (update: any) => {
+            const { connection } = update;
+            const connLogContext = `${logContext} [Baileys Connection]`;
+            if (connection === 'open') {
+                customLog('INFO', connLogContext, "Conexión abierta. Suscribiéndose ahora a 'messages.upsert'.");
+
+                provider.vendor.ev.removeAllListeners('messages.upsert'); // Prevenir duplicados en reconexión
+                provider.vendor.ev.on('messages.upsert', async ({ messages, type }) => {
+                    const upsertLogContext = `MESSAGES_UPSERT_HANDLER`;
+                    // customLog('DEBUG', upsertLogContext, `Evento: ${type}, Mensajes: ${messages.length}`);
+
+                    for (const msg of messages) {
+                        if (!msg.message || msg.key.remoteJid === 'status@broadcast') continue;
+                        const messageBody = extractTextFromMessage(msg);
+
+                        if (msg.key.fromMe && messageBody) {
+                            const recipientJid = msg.key.remoteJid;
+                            const shortRecipientJid = getShortUserId(recipientJid);
+                            const currentMsgContext = `${upsertLogContext} [to:${shortRecipientJid}]`;
+
+                            customLog('DEBUG', currentMsgContext, `Mensaje 'fromMe' detectado. Body: "${messageBody.substring(0, 60)}..."`);
+
+                            if (messageBody.startsWith(ENCARGADO_SYNC_PREFIX)) {
+                                customLog('INFO', currentMsgContext, `Prefijo SYNC de encargado detectado.`);
+                                const encargadoMessageContent = messageBody.substring(ENCARGADO_SYNC_PREFIX.length).trim();
+                                
+                                if (!encargadoMessageContent) {
+                                    customLog('WARN', currentMsgContext, `Mensaje SYNC del encargado está vacío.`);
+                                    continue;
+                                }
+                                try {
+                                    const clientStateObject = await adapterDB.get(recipientJid);
+                                    if (!clientStateObject || typeof clientStateObject !== 'object') {
+                                        customLog('WARN', currentMsgContext, `No se encontró estado o no es un objeto para cliente ${shortRecipientJid}. No se puede sincronizar.`);
+                                        continue;
+                                    }
+                                    const threadId = clientStateObject[OPENAI_THREAD_ID_KEY];
+                                    if (!threadId) {
+                                        customLog('WARN', currentMsgContext, `No se encontró thread_id (key: ${OPENAI_THREAD_ID_KEY}) en estado de ${shortRecipientJid}.`);
+                                        continue;
+                                    }
+                                    customLog('INFO', currentMsgContext, `Añadiendo mensaje de encargado al thread ${threadId}: "${encargadoMessageContent.substring(0,50)}"`);
+                                    await openai.beta.threads.messages.create(threadId, {
+                                        role: 'assistant', 
+                                        content: encargadoMessageContent
+                                    });
+                                    customLog('INFO', currentMsgContext, `Mensaje de encargado sincronizado con OpenAI para ${shortRecipientJid}.`);
+                                } catch (e: any) {
+                                    customLog('ERROR', currentMsgContext, `Error sincronizando mensaje de encargado para ${shortRecipientJid}:`, e.message, e.stack);
+                                }
+                            }
+                        }
+                    }
+                });
+            } else if (connection === 'close') {
+                 customLog('WARN', connLogContext, "Conexión cerrada.");
+            }
+        });
+    } else {
+        let reason = "";
+        if (!openai) reason += "SDK de OpenAI no inicializado. ";
+        if (!provider?.vendor?.ev) reason += "provider.vendor.ev no disponible. ";
+        customLog('WARN', logContext, `No se puede configurar listener para 'messages.upsert'. Razón: ${reason.trim()}`);
+    }
+
+    // httpInject ahora usa 'baseAdapterProvider' porque 'provider.server' podría no ser el servidor HTTP que espera httpInject.
+    // Generalmente, el httpInject se aplica al servidor que Baileys/Venom crea, que está en la instancia original.
+    if (baseAdapterProvider.server && typeof httpInject === 'function') {
+        httpInject(baseAdapterProvider.server);
+        customLog('INFO', logContext, `Inyección HTTP para el proveedor aplicada.`);
+    } else {
+        customLog('WARN', logContext, `No se pudo aplicar inyección HTTP al proveedor (baseAdapterProvider.server no disponible o httpInject no es función).`);
+    }
+
+    if (httpServer && typeof httpServer === 'function') {
+        httpServer(Number(PORT));
+        customLog('INFO', logContext, `Llamada a httpServer(${PORT}) realizada.`);
+    } else {
+        customLog('ERROR', logContext, `httpServer no es una función o no se obtuvo.`);
+    }
+};
+
+main().catch(err => {
+    customLog('ERROR', `[MAIN_INIT]`, `Error fatal al iniciar bot:`, err);
+    process.exit(1);
+});
+
+---
+
+/////////////////////////////////
+RETO 1.1
+////////////////////////////////
+Ret0 1.1
+
+tenog este codigo:
+
+
+
+import "dotenv/config"
+
+import OpenAI from 'openai';
+
+import { createBot, createProvider, createFlow, addKeyword, EVENTS } from '@builderbot/bot'
+
+import { MemoryDB } from '@builderbot/bot'
+
+import { BaileysProvider } from '@builderbot/provider-baileys'
+
+import { toAsk, httpInject } from "@builderbot-plugins/openai-assistants"
+
+import fs from 'fs';
+
+
+
+// --- Constantes ---
+
+const PORT = process.env.PORT ?? 3008;
+
+const ASSISTANT_ID = process.env.ASSISTANT_ID ?? '';
+
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY ?? '';
+
+
+
+const CHUNK_DELAY_MS = 150;
+
+const OPENAI_COOLDOWN_MS = 3000;
+
+const CLEAN_REGEX = /【.*?】[ ]?/g;
+
+const USER_INACTIVITY_TIMEOUT_MS = 6000; // Tiempo de inactividad para agrupar mensajes de cliente
+
+const MANUAL_INACTIVITY_TIMEOUT_MS = 6000; // Tiempo de inactividad para agrupar mensajes manuales
+
+const DEBUG_MODE = true;
+
+const DEBUG_LOG_PATH = './whatsapp-sync-debug.log';
+
+
+
+// --- Mapeo de conversaciones ---
+
+const clientThreadIds = new Map<string, string>();
+
+
+
+// --- SDK de OpenAI ---
+
+let openai: OpenAI;
+
+if (OPENAI_API_KEY) {
+
+    openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+
+    console.log("SDK de OpenAI inicializado correctamente");
+
+} else {
+
+    console.error("CRITICAL_ENV_ERROR: OPENAI_API_KEY no está configurada en el archivo .env.");
+
+    // Considera process.exit(1) si la API key es crucial para el arranque
+
+}
+
+
+
+// --- Almacenamiento para mensajes enviados por el bot (identificados por su contenido temporalmente) ---
+
+// Ya no usaremos botSentMessages, nos basaremos en el 'type' del evento 'messages.upsert'
+
+
+
+// --- Otras estructuras de datos ---
+
+const userQueues = new Map<string, Array<any>>();
+
+const userLocks = new Map<string, boolean>();
+
+const userMessageBuffers = new Map<string, any>();
+
+const userActivityTimers = new Map<string, NodeJS.Timeout>();
+
+
+
+// --- Estructuras para mensajes manuales ---
+
+const manualMessageBuffers = new Map<string, string[]>();
+
+const manualActivityTimers = new Map<string, NodeJS.Timeout>();
+
+
+
+// --- Funciones de utilidad ---
+
+const getFormattedTimestamp = (): string => {
+
+    const now = new Date();
+
+    const dateOptions: Intl.DateTimeFormatOptions = { year: '2-digit', month: '2-digit', day: '2-digit' };
+
+    const timeOptions: Intl.DateTimeFormatOptions = { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false };
+
+    const date = now.toLocaleDateString('es-CO', dateOptions);
+
+    const time = now.toLocaleTimeString('es-CO', timeOptions);
+
+    const ms = String(now.getMilliseconds()).padStart(3, '0');
+
+    return `${date} ${time}.${ms}`;
+
+};
+
+
+
+const customLog = (level: 'INFO' | 'WARN' | 'ERROR' | 'DEBUG', context: string, ...messages: any[]) => {
+
+    const timestamp = getFormattedTimestamp();
+
+    const messageParts = messages.map(msg => {
+
+        if (msg instanceof Error) return msg.stack || msg.message;
+
+        if (typeof msg === 'object' && msg !== null) {
+
+            try { return JSON.stringify(msg, null, 2); } catch (e) { return '[Objeto no serializable]'; }
+
+        }
+
+        return String(msg);
+
+    });
+
+    const logLine = `[${timestamp}] [${level}] ${context}: ${messageParts.join(' ')}`;
+
+    switch (level) {
+
+        case 'INFO': console.log(logLine); break;
+
+        case 'WARN': console.warn(logLine); break;
+
+        case 'ERROR': console.error(logLine); break;
+
+        case 'DEBUG': console.debug(logLine); break;
+
+    }
+
+    
+
+    if (DEBUG_MODE && (level === 'ERROR' || level === 'WARN' || level === 'DEBUG' || level === 'INFO')) { // Incluimos INFO para mejor seguimiento
+
+        try {
+
+            fs.appendFileSync(DEBUG_LOG_PATH, `[${new Date().toISOString()}] [${level}_${context}] ${messageParts.join(' ')}\n`);
+
+        } catch (e: any) {
+
+            console.error(`Error escribiendo al log: ${e.message}`);
+
+        }
+
+    }
+
+};
+
+
+
+const getShortUserId = (ctxOrUserId: any): string => {
+
+    if (typeof ctxOrUserId === 'string') return ctxOrUserId.split('@')[0] || ctxOrUserId;
+
+    return ctxOrUserId?.from?.split('@')[0] || ctxOrUserId?.from || ctxOrUserId?.key?.remoteJid?.split('@')[0] || 'unknownUser';
+
+};
+
+
+
+const extractTextFromMessage = (msg: any): string | null => {
+
+    if (!msg || !msg.message) return null;
+
+    return msg.message.conversation ||
+
+           msg.message.extendedTextMessage?.text ||
+
+           msg.message.imageMessage?.caption ||
+
+           msg.message.videoMessage?.caption ||
+
+           msg.message.ephemeralMessage?.message?.extendedTextMessage?.text ||
+
+           msg.message.ephemeralMessage?.message?.conversation ||
+
+           null;
+
+};
+
+
+
+// --- Función para sincronizar mensajes manuales con OpenAI ---
+
+async function syncManualMessageToOpenAI(jid: string, messageContent: string) {
+
+    const shortJid = getShortUserId(jid);
+
+    const logContext = `SYNC_MANUAL [${shortJid}]`;
+
+    
+
+    if (!openai) {
+
+        customLog('ERROR', logContext, `SDK de OpenAI no inicializado. No se puede sincronizar.`);
+
+        return false;
+
+    }
+
+    
+
+    try {
+
+        const threadId = clientThreadIds.get(jid);
+
+        
+
+        if (!threadId) {
+
+            customLog('WARN', logContext, `No se encontró thread_id en memoria para ${shortJid}. No se puede sincronizar mensaje manual: "${messageContent.substring(0,60)}..."`);
+
+            return false;
+
+        }
+
+        
+
+        customLog('INFO', logContext, `Thread ID encontrado en memoria: ${threadId}. Sincronizando mensaje manual: "${messageContent.substring(0,60)}..."`);
+
+        
+
+        const result = await openai.beta.threads.messages.create(threadId, {
+
+            role: 'assistant', // Los mensajes manuales del encargado se reflejan como si el asistente los hubiera dicho en el hilo
+
+            content: messageContent
+
+        });
+
+        
+
+        customLog('INFO', logContext, `Mensaje manual sincronizado con OpenAI exitosamente. Message ID: ${result.id}`);
+
+        return true;
+
+    } catch (error) {
+
+        customLog('ERROR', logContext, `Error sincronizando mensaje manual con OpenAI:`, error);
+
+        return false;
+
+    }
+
+}
+
+
+
+// --- Función para manejar mensajes manuales ---
+
+function handleManualMessage(jid: string, messageBody: string) {
+
+    const shortJid = getShortUserId(jid);
+
+    
+
+    if (!manualMessageBuffers.has(jid)) {
+
+        manualMessageBuffers.set(jid, []);
+
+    }
+
+    
+
+    const buffer = manualMessageBuffers.get(jid)!;
+
+    buffer.push(messageBody);
+
+    
+
+    customLog('INFO', `MANUAL_MSG_BUFFER [to:${shortJid}]`, `Mensaje manual añadido al buffer. Total: ${buffer.length}. Contenido: "${messageBody.substring(0,60)}..."`);
+
+    
+
+    if (manualActivityTimers.has(jid)) {
+
+        clearTimeout(manualActivityTimers.get(jid)!);
+
+    }
+
+    
+
+    const timerId = setTimeout(async () => {
+
+        const messages = manualMessageBuffers.get(jid);
+
+        if (messages && messages.length > 0) {
+
+            const combinedMessage = messages.join('\n\n');
+
+            
+
+            customLog('INFO', `MANUAL_MSG_TIMEOUT [to:${shortJid}]`, 
+
+                `Enviando ${messages.length} mensajes manuales combinados a OpenAI: "${combinedMessage.substring(0, 60)}..."`);
+
+            
+
+            await syncManualMessageToOpenAI(jid, combinedMessage);
+
+        }
+
+        
+
+        manualMessageBuffers.delete(jid);
+
+        manualActivityTimers.delete(jid);
+
+    }, MANUAL_INACTIVITY_TIMEOUT_MS);
+
+    
+
+    manualActivityTimers.set(jid, timerId);
+
+}
+
+
+
+// --- Función de typing ---
+
+const typing = async (ctx: any, provider: any): Promise<void> => {
+
+    const remoteJid = ctx.key?.remoteJid || ctx.from; // Asegurar que remoteJid se obtenga correctamente
+
+    if (provider?.vendor?.sendPresenceUpdate && typeof provider.vendor.sendPresenceUpdate === 'function' && remoteJid) {
+
+        try {
+
+            await provider.vendor.sendPresenceUpdate('composing', remoteJid);
+
+        } catch (e) {
+
+            customLog('ERROR', 'TYPING', `Error al enviar 'composing' a ${remoteJid}:`, e);
+
+        }
+
+    }
+
+};
+
+
+
+// --- Procesa mensajes del usuario ---
+
+const processUserMessage = async (ctx: any, { flowDynamic, state, provider }: any) => {
+
+    const shortUserId = getShortUserId(ctx.from);
+
+    const logContext = `PROCESS_MSG [${shortUserId}]`;
+
+    let mensajeParaOpenAI = ctx.body;
+
+    const clientId = ctx.from;
+
+
+
+    // Lógica de nota contextual (si aplica)
+
+    const esperandoEncargado = await state.get('esperando_respuesta_encargado');
+
+    if (esperandoEncargado) {
+
+        const temaConsulta = await state.get('tema_consulta_encargado') || 'un tema previo';
+
+        const notaContextual = `[Nota para el Asistente: El usuario podría estar respondiendo a información proporcionada manualmente por un encargado sobre "${temaConsulta}". Por favor, ten esto en cuenta al generar tu respuesta.]\n\n`;
+
+        mensajeParaOpenAI = notaContextual + ctx.body;
+
+        customLog('INFO', logContext, `Añadiendo nota contextual para OpenAI sobre "${temaConsulta}".`);
+
+        await state.update({ esperando_respuesta_encargado: false, tema_consulta_encargado: null });
+
+    }
+
+
+
+    customLog('INFO', logContext, `Iniciando procesamiento OpenAI para: "${mensajeParaOpenAI.substring(0,100)}..."`);
+
+    await typing(ctx, provider);
+
+
+
+    customLog('INFO', logContext, `Solicitando respuesta a OpenAI Assistant (${ASSISTANT_ID.substring(0,10)})...`);
+
+    
+
+    if (!openai) {
+
+         customLog('ERROR', logContext, `SDK de OpenAI no inicializado. No se puede llamar a toAsk.`);
+
+         await flowDynamic([{ body: "Hubo un problema conectando con nuestro asistente. Por favor, intente más tarde." }]);
+
+         return;
+
+    }
+
+    const response = await toAsk(ASSISTANT_ID, mensajeParaOpenAI, state);
+
+    
+
+    // Extracción del thread_id
+
+    try {
+
+        const threadFromState = await state.get('thread');
+
+        customLog('DEBUG', logContext, `Valor de state.get('thread'):`, threadFromState);
+
+
+
+        let threadId: string | null = null;
+
+
+
+        if (threadFromState && typeof threadFromState === 'string' && threadFromState.startsWith('thread_')) {
+
+            threadId = threadFromState;
+
+            customLog('INFO', logContext, `Thread ID encontrado en state.get('thread'): ${threadId}`);
+
+        } else {
+
+            // Fallback a otras posibles ubicaciones si 'thread' no funciona como se espera
+
+            const openaiAssistant = await state.get('openaiAssistant');
+
+            if (openaiAssistant && typeof openaiAssistant === 'object' && openaiAssistant.thread_id) {
+
+                threadId = openaiAssistant.thread_id;
+
+                customLog('INFO', logContext, `Thread ID encontrado en openaiAssistant.thread_id: ${threadId}`);
+
+            } else {
+
+                 const openaiState = await state.get('openai'); // 'openai' en lugar de openai
+
+                 if (openaiState && typeof openaiState === 'object' && openaiState.thread_id) {
+
+                    threadId = openaiState.thread_id;
+
+                    customLog('INFO', logContext, `Thread ID encontrado en openai.thread_id: ${threadId}`);
+
+                 }
+
+            }
+
+        }
+
+        
+
+        if (threadId) {
+
+            if (clientThreadIds.get(clientId) !== threadId) {
+
+                 clientThreadIds.set(clientId, threadId);
+
+                 customLog('INFO', logContext, `Thread ID (${threadId}) guardado/actualizado para cliente ${shortUserId}.`);
+
+            } else {
+
+                 customLog('DEBUG', logContext, `Thread ID (${threadId}) ya estaba guardado para cliente ${shortUserId}.`);
+
+            }
+
+        } else {
+
+            customLog('WARN', logContext, `No se pudo encontrar thread_id para el cliente ${shortUserId} después de llamar a toAsk.`);
+
+        }
+
+    } catch (e) {
+
+        customLog('ERROR', logContext, `Error al extraer thread_id:`, e);
+
+    }
+
+    
+
+    customLog('INFO', logContext, `Respuesta de OpenAI recibida: "${response.substring(0,50)}..."`);
+
+
+
+    const chunks = response.split(/\n\n+/);
+
+    for (const chunk of chunks) {
+
+        const cleanedChunk = chunk.trim().replace(CLEAN_REGEX, "");
+
+        if (cleanedChunk) {
+
+            customLog('INFO', logContext, `Enviando chunk: "${cleanedChunk.substring(0, 50)}..."`);
+
+            await flowDynamic([{ body: cleanedChunk }]); // No necesitamos el msgResult para botSentMessages
+
+            
+
+            if (cleanedChunk.toLowerCase().includes("espere, me comunico con el encargado") || 
+
+                cleanedChunk.toLowerCase().includes("confirmo con encargado") ||
+
+                cleanedChunk.toLowerCase().includes("confirmo los precios en el sistema y le aviso")) {
+
+                let tema = "información general";
+
+                const originalUserQuery = ctx.body; 
+
+                if (originalUserQuery.toLowerCase().includes("precio")) tema = "precios";
+
+                if (originalUserQuery.toLowerCase().includes("disponibilidad")) tema = "disponibilidad";
+
+                if (originalUserQuery.toLowerCase().includes("ubicado") || originalUserQuery.toLowerCase().includes("distancia")) tema = "ubicación";
+
+                
+
+                await state.update({ esperando_respuesta_encargado: true, tema_consulta_encargado: tema });
+
+                customLog('INFO', logContext, `Bot indicó comunicación con encargado sobre tema "${tema}". Estado 'esperando_respuesta_encargado' activado para ${shortUserId}.`);
+
+            }
+
+            await new Promise(resolve => setTimeout(resolve, CHUNK_DELAY_MS));
+
+        }
+
+    }
+
+    customLog('INFO', logContext, `Todos los chunks enviados para el mensaje original del cliente: "${ctx.body.substring(0,30)}..."`);
+
+};
+
+
+
+// --- Manejo de Cola ---
+
+const handleQueue = async (userId: string) => {
+
+    const queue = userQueues.get(userId);
+
+    const shortUserId = getShortUserId(userId);
+
+    const logContext = `HANDLE_QUEUE [${shortUserId}]`;
+
+
+
+    if (!queue) {
+
+        customLog('DEBUG', logContext, `No se encontró cola.`); // Cambiado a DEBUG
+
+        userLocks.delete(userId);
+
+        return;
+
+    }
+
+    
+
+    if (userLocks.get(userId)) {
+
+        customLog('DEBUG', logContext, `La cola está bloqueada.`); // Cambiado a DEBUG
+
+        return;
+
+    }
+
+
+
+    while (queue.length > 0) {
+
+        if (userLocks.get(userId)) {
+
+            customLog('DEBUG', logContext, `Bloqueo activado en bucle.`); // Cambiado a DEBUG
+
+            return;
+
+        }
+
+        userLocks.set(userId, true);
+
+        customLog('DEBUG', logContext, `Bloqueo adquirido.`); // Cambiado a DEBUG
+
+        const task = queue.shift();
+
+
+
+        if (task) {
+
+            const { ctx, flowDynamic, state, provider } = task; 
+
+            customLog('INFO', logContext, `Procesando tarea. Restantes: ${queue.length}. Msg: "${String(ctx.body).substring(0,100)}..."`);
+
+            try {
+
+                await processUserMessage(ctx, { flowDynamic, state, provider });
+
+                customLog('INFO', logContext, `Tarea completada.`);
+
+            } catch (error: any) {
+
+                const errorMessage = error.message || String(error);
+
+                customLog('ERROR', logContext, `Error en tarea para msg "${String(ctx.body).substring(0,30)}...":`, error);
+
+                if (errorMessage.includes("while a run") && errorMessage.includes("is active")) {
+
+                    customLog('ERROR', logContext, `OpenAI Run activo. Cooldown actual: ${OPENAI_COOLDOWN_MS}ms.`);
+
+                }
+
+            } finally {
+
+                userLocks.set(userId, false);
+
+                customLog('DEBUG', logContext, `Bloqueo liberado.`); // Cambiado a DEBUG
+
+                if (queue.length > 0) {
+
+                    customLog('INFO', logContext, `${queue.length} en cola. Cooldown ${OPENAI_COOLDOWN_MS}ms.`);
+
+                    await new Promise(resolve => setTimeout(resolve, OPENAI_COOLDOWN_MS));
+
+                }
+
+            }
+
+        } else {
+
+            userLocks.set(userId, false); // Asegurar liberación si la tarea es nula
+
+            customLog('WARN', logContext, `Tarea nula encontrada en la cola. Bloqueo liberado.`);
+
+            break; 
+
+        }
+
+    }
+
+
+
+    if (queue.length === 0 && !userLocks.get(userId)) { // Doble check de userLocks
+
+        userQueues.delete(userId);
+
+        userLocks.delete(userId); // Asegurar que el lock se borre
+
+        customLog('INFO', logContext, `Cola vacía y desbloqueada. Limpiada.`);
+
+    }
+
+};
+
+
+
+// --- Flujo Principal ---
+
+const mainFlow = addKeyword<BaileysProvider, MemoryDB>(EVENTS.WELCOME)
+
+    .addAction(async (ctx, args) => {
+
+        // Ignorar mensajes salientes que activan el flujo por error (aunque fromMe debería prevenir esto en addKeyword)
+
+        if (ctx.key.fromMe) { 
+
+            customLog('DEBUG', `MAIN_FLOW_IGNORE_FROM_ME`, `Mensaje de ${getShortUserId(ctx.from)} ignorado porque ctx.key.fromMe es true.`);
+
+            return;
+
+        }
+
+
+
+        const { flowDynamic, state, provider } = args;
+
+        const clientId = ctx.from;
+
+        const shortClientId = getShortUserId(clientId);
+
+        const currentMessageBody = ctx.body;
+
+        const logContextClient = `CLIENT_MSG_HANDLER [from:${shortClientId}]`;
+
+
+
+        customLog('INFO', logContextClient, `Mensaje de cliente "${currentMessageBody.substring(0,30)}..." recibido.`);
+
+
+
+        let userBuffer = userMessageBuffers.get(clientId);
+
+        if (!userBuffer) {
+
+            userBuffer = { messages: [], lastCtx: ctx, flowDynamic, state, provider };
+
+            userMessageBuffers.set(clientId, userBuffer);
+
+            customLog('INFO', logContextClient, `Nuevo buffer de mensajes creado para cliente.`);
+
+        }
+
+        
+
+        userBuffer.messages.push(currentMessageBody);
+
+        userBuffer.lastCtx = ctx; // Actualizar con el contexto más reciente
+
+        // Actualizar flowDynamic, state y provider en caso de que cambien entre activaciones para el mismo usuario
+
+        userBuffer.flowDynamic = flowDynamic;
+
+        userBuffer.state = state; 
+
+        userBuffer.provider = provider;
+
+
+
+
+
+        customLog('INFO', logContextClient, `Mensaje añadido al buffer del cliente. Total en buffer: ${userBuffer.messages.length}.`);
+
+
+
+        if (userActivityTimers.has(clientId)) {
+
+            clearTimeout(userActivityTimers.get(clientId)!);
+
+        }
+
+
+
+        const timerId = setTimeout(async () => {
+
+            const finalBuffer = userMessageBuffers.get(clientId);
+
+            if (finalBuffer && finalBuffer.messages.length > 0) {
+
+                const combinedMessageBody = finalBuffer.messages.join('\n\n');
+
+                // Usar el último contexto (lastCtx) pero con el cuerpo combinado
+
+                const taskCtx = { ...finalBuffer.lastCtx, body: combinedMessageBody }; 
+
+                // Pasar el estado y proveedor del buffer más reciente
+
+                const taskArgs = { 
+
+                    flowDynamic: finalBuffer.flowDynamic, 
+
+                    state: finalBuffer.state, 
+
+                    provider: finalBuffer.provider 
+
+                };
+
+
+
+
+
+                if (!userQueues.has(clientId)) {
+
+                    userQueues.set(clientId, []);
+
+                }
+
+                const queue = userQueues.get(clientId)!;
+
+                queue.push({ 
+
+                    ctx: taskCtx, 
+
+                    ...taskArgs // Esparcir los argumentos
+
+                });
+
+                customLog('INFO', `USER_ACTIVITY_TIMEOUT [from:${shortClientId}]`, `${finalBuffer.messages.length} msgs combinados y encolados: "${combinedMessageBody.substring(0,100)}..."`);
+
+
+
+                if (!userLocks.get(clientId)) {
+
+                    customLog('INFO', `USER_ACTIVITY_TIMEOUT [from:${shortClientId}]`, `Cola principal no bloqueada. Iniciando handleQueue.`);
+
+                    handleQueue(clientId);
+
+                } else {
+
+                    customLog('INFO', `USER_ACTIVITY_TIMEOUT [from:${shortClientId}]`, `Cola principal bloqueada. Msg combinado esperará.`);
+
+                }
+
+            }
+
+            userMessageBuffers.delete(clientId);
+
+            userActivityTimers.delete(clientId);
+
+        }, USER_INACTIVITY_TIMEOUT_MS);
+
+
+
+        userActivityTimers.set(clientId, timerId);
+
+        customLog('INFO', logContextClient, `Temporizador de inactividad (${USER_INACTIVITY_TIMEOUT_MS / 1000}s) iniciado/reiniciado para cliente.`);
+
+    });
+
+
+
+// --- Función Principal (main) ---
+
+const main = async () => {
+
+    const logContext = `[MAIN_INIT]`;
+
+    customLog('INFO', logContext, `Iniciando el bot en el puerto ${PORT}`);
+
+    
+
+    if (!ASSISTANT_ID) {
+
+        customLog('ERROR', logContext, `CRITICAL: La variable de entorno ASSISTANT_ID no está configurada. Saliendo.`);
+
+        process.exit(1);
+
+    }
+
+    
+
+    if (!OPENAI_API_KEY || !openai) { // Chequea que openai (el SDK) esté inicializado
+
+        customLog('ERROR', logContext, `CRITICAL: OPENAI_API_KEY no configurada o SDK de OpenAI no inicializado. Sincronización no funcionará.`);
+
+        process.exit(1); // Salir si OpenAI no está configurado, ya que es esencial
+
+    }
+
+    
+
+    customLog('INFO', logContext, `Usando Assistant ID: ${ASSISTANT_ID.substring(0,10)}...`);
+
+    customLog('INFO', logContext, `OpenAI Cooldown: ${OPENAI_COOLDOWN_MS}ms.`);
+
+    customLog('INFO', logContext, `User Inactivity Timeout: ${USER_INACTIVITY_TIMEOUT_MS}ms.`);
+
+    customLog('INFO', logContext, `Manual Messages Timeout: ${MANUAL_INACTIVITY_TIMEOUT_MS}ms.`);
+
+    
+
+    if (DEBUG_MODE) {
+
+        try {
+
+            fs.writeFileSync(DEBUG_LOG_PATH, `--- Nuevo log de diagnóstico ${new Date().toISOString()} ---\n`);
+
+        } catch (e: any) {
+
+            console.error(`Error creando archivo de diagnóstico: ${e.message}`);
+
+        }
+
+    }
+
+
+
+    const adapterFlow = createFlow([mainFlow]);
+
+    const adapterDB = new MemoryDB();
+
+    const adapterProvider = createProvider(BaileysProvider, { gruposIgnore: true, readStatus: false });
+
+
+
+    const { httpServer, provider } = await createBot({
+
+        flow: adapterFlow,
+
+        provider: adapterProvider,
+
+        database: adapterDB,
+
+    });
+
+
+
+    provider.on('ready', () => {
+
+        customLog('INFO', logContext, "Bot en estado 'ready'. Configurando detección de mensajes manuales.");
+
+        
+
+        const socket = provider.socket || provider.vendor; // provider.vendor es común en Baileys
+
+        
+
+        if (!socket?.ev?.on) {
+
+            customLog('ERROR', logContext, "No se pudo acceder al socket de Baileys (socket.ev.on no disponible). No se detectarán mensajes manuales.");
+
+            return;
+
+        }
+
+        
+
+        socket.ev.on('messages.upsert', async ({ messages, type: messagesUpsertType }: any) => {
+
+            customLog('DEBUG', "MESSAGES_UPSERT", `Evento recibido: tipo_evento=${messagesUpsertType}, mensajes=${messages?.length || 0}`);
+
+            
+
+            if (!messages || !Array.isArray(messages)) return;
+
+            
+
+            for (const msg of messages) {
+
+                if (!msg.message || msg.key.remoteJid === 'status@broadcast') continue;
+
+                
+
+                const messageBody = extractTextFromMessage(msg);
+
+                if (!messageBody) continue;
+
+                
+
+                // Solo procesamos mensajes salientes (fromMe === true)
+
+                if (msg.key.fromMe === true) {
+
+                    const jid = msg.key.remoteJid;
+
+                    const shortJid = getShortUserId(jid);
+
+                    
+
+                    // Si el tipo de evento es 'append', es un mensaje que el bot envió programáticamente (via flowDynamic).
+
+                    // Estos NO son mensajes manuales del encargado.
+
+                    if (messagesUpsertType === 'append') {
+
+                        customLog('DEBUG', "BOT_SELF_MSG_APPEND", `Mensaje (type: ${messagesUpsertType}) saliente a ${shortJid} ignorado (asumido self/bot): "${messageBody.substring(0,60)}..."`);
+
+                        continue; 
+
+                    }
+
+
+
+                    // Si llegamos aquí, msg.key.fromMe es true y el tipo NO es 'append'.
+
+                    // Asumimos que es un mensaje manual enviado por el encargado desde WhatsApp Web/Desktop.
+
+                    // (El tipo suele ser 'notify' para estos casos)
+
+                    customLog('INFO', `MANUAL_MSG_DETECTED [to:${shortJid}]`, `Mensaje manual (type: ${messagesUpsertType}) detectado: "${messageBody.substring(0, 60)}..."`);
+
+                    
+
+                    // Solo procesar si tenemos un thread_id para este cliente (el cliente debe haber interactuado primero)
+
+                    if (clientThreadIds.has(jid)) {
+
+                        handleManualMessage(jid, messageBody);
+
+                    } else {
+
+                        customLog('WARN', `MANUAL_MSG_NO_THREAD [to:${shortJid}]`, `No hay thread_id para ${shortJid}. Mensaje manual "${messageBody.substring(0,60)}..." no sincronizado. El cliente debe interactuar primero.`);
+
+                    }
+
+                }
+
+            }
+
+        });
+
+        
+
+        customLog('INFO', logContext, "Listener para mensajes de Baileys ('messages.upsert') configurado con éxito.");
+
+    });
+
+
+
+    if (adapterProvider.server && typeof httpInject === 'function') {
+
+        httpInject(adapterProvider.server);
+
+        customLog('INFO', logContext, `Inyección HTTP para el proveedor aplicada.`);
+
+    } else {
+
+        customLog('WARN', logContext, `No se pudo aplicar inyección HTTP al proveedor (servidor o función httpInject no disponibles).`);
+
+    }
+
+
+
+    if (httpServer && typeof httpServer === 'function') {
+
+        httpServer(Number(PORT)); // Asegúrate de que PORT sea un número
+
+        customLog('INFO', logContext, `Servidor HTTP iniciado en puerto ${PORT}.`);
+
+    } else {
+
+        customLog('ERROR', logContext, `httpServer no es una función o no está definido. El servidor HTTP no se iniciará.`);
+
+    }
+
+};
+
+
+
+main().catch(err => {
+
+    customLog('ERROR', `[MAIN_FATAL]`, `Error fatal al iniciar bot:`, err);
+
+    process.exit(1);
+
+});
+
+
+
+y me arroja este flujo en la terminal:
+
+
+
+🛜  HTTP Server ON 
+
+[GET]: http://localhost:3008/v1/form
+
+[GET]: http://localhost:3008/
+
+[POST]: http://localhost:3008/v1/upload
+
+
+
+✅ Connected Provider
+
+Tell a contact on your WhatsApp to write "hello"...
+
+
+
+[nodemon] restarting due to changes...
+
+[nodemon] starting `tsx ./src/app.ts`
+
+[nodemon] clean exit - waiting for changes before restart
+
+[nodemon] restarting due to changes...
+
+[nodemon] starting `tsx ./src/app.ts`
+
+SDK de OpenAI inicializado correctamente
+
+[19/05/25 22:02:46.579] [INFO] [MAIN_INIT]: Iniciando el bot en el puerto 3008
+
+[19/05/25 22:02:46.629] [INFO] [MAIN_INIT]: Usando Assistant ID: asst_AZUrB...
+
+[19/05/25 22:02:46.633] [INFO] [MAIN_INIT]: OpenAI Cooldown: 3000ms.
+
+[19/05/25 22:02:46.637] [INFO] [MAIN_INIT]: User Inactivity Timeout: 6000ms.
+
+[19/05/25 22:02:46.640] [INFO] [MAIN_INIT]: Manual Messages Timeout: 6000ms.
+
+[19/05/25 22:02:46.692] [INFO] [MAIN_INIT]: Inyección HTTP para el proveedor aplicada.
+
+[19/05/25 22:02:46.704] [INFO] [MAIN_INIT]: Servidor HTTP iniciado en puerto 3008.
+
+🛜  HTTP Server ON 
+
+[GET]: http://localhost:3008/v1/form
+
+[GET]: http://localhost:3008/
+
+[POST]: http://localhost:3008/v1/upload
+
+
+
+✅ Connected Provider
+
+Tell a contact on your WhatsApp to write "hello"...
+
+
+
+[19/05/25 22:02:47.996] [INFO] [MAIN_INIT]: Bot en estado 'ready'. Configurando detección de mensajes manuales.
+
+[19/05/25 22:02:48.002] [INFO] [MAIN_INIT]: Listener para mensajes de Baileys ('messages.upsert') configurado con éxito.
+
+[19/05/25 22:02:57.597] [DEBUG] MESSAGES_UPSERT: Evento recibido: tipo_evento=notify, mensajes=1
+
+[19/05/25 22:02:57.604] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Mensaje de cliente "Hila..." recibido.
+
+[19/05/25 22:02:57.605] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Nuevo buffer de mensajes creado para cliente.
+
+[19/05/25 22:02:57.606] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Mensaje añadido al buffer del cliente. Total en buffer: 1.
+
+[19/05/25 22:02:57.606] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Temporizador de inactividad (6s) iniciado/reiniciado para cliente.
+
+[19/05/25 22:03:02.240] [DEBUG] MESSAGES_UPSERT: Evento recibido: tipo_evento=notify, mensajes=1
+
+[19/05/25 22:03:02.246] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Mensaje de cliente "Ju..." recibido.
+
+[19/05/25 22:03:02.247] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Mensaje añadido al buffer del cliente. Total en buffer: 2.
+
+[19/05/25 22:03:02.251] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Temporizador de inactividad (6s) iniciado/reiniciado para cliente.
+
+[19/05/25 22:03:03.494] [DEBUG] MESSAGES_UPSERT: Evento recibido: tipo_evento=notify, mensajes=1
+
+[19/05/25 22:03:03.499] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Mensaje de cliente "Ggh..." recibido.
+
+[19/05/25 22:03:03.500] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Mensaje añadido al buffer del cliente. Total en buffer: 3.
+
+[19/05/25 22:03:03.502] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Temporizador de inactividad (6s) iniciado/reiniciado para cliente.
+
+[19/05/25 22:03:04.721] [DEBUG] MESSAGES_UPSERT: Evento recibido: tipo_evento=notify, mensajes=1
+
+[19/05/25 22:03:04.730] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Mensaje de cliente "Ghh..." recibido.
+
+[19/05/25 22:03:04.731] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Mensaje añadido al buffer del cliente. Total en buffer: 4.
+
+[19/05/25 22:03:04.733] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Temporizador de inactividad (6s) iniciado/reiniciado para cliente.
+
+[19/05/25 22:03:10.736] [INFO] USER_ACTIVITY_TIMEOUT [from:573003913251]: 4 msgs combinados y encolados: "Hila
+
+
+
+Ju
+
+
+
+Ggh
+
+
+
+Ghh..."
+
+[19/05/25 22:03:10.737] [INFO] USER_ACTIVITY_TIMEOUT [from:573003913251]: Cola principal no bloqueada. Iniciando handleQueue.
+
+[19/05/25 22:03:10.739] [DEBUG] HANDLE_QUEUE [573003913251]: Bloqueo adquirido.
+
+[19/05/25 22:03:10.740] [INFO] HANDLE_QUEUE [573003913251]: Procesando tarea. Restantes: 0. Msg: "Hila
+
+
+
+Ju
+
+
+
+Ggh
+
+
+
+Ghh..."
+
+[19/05/25 22:03:10.742] [INFO] PROCESS_MSG [573003913251]: Iniciando procesamiento OpenAI para: "Hila
+
+
+
+Ju
+
+
+
+Ggh
+
+
+
+Ghh..."
+
+[19/05/25 22:03:10.762] [INFO] PROCESS_MSG [573003913251]: Solicitando respuesta a OpenAI Assistant (asst_AZUrB)...
+
+Hola, ¿cómo puedo ayudarte hoy? 😊
+
+[19/05/25 22:03:16.025] [DEBUG] PROCESS_MSG [573003913251]: Valor de state.get('thread'): thread_uj69L9Tm8MhKM7TT4S8tuLNX
+
+[19/05/25 22:03:16.026] [INFO] PROCESS_MSG [573003913251]: Thread ID encontrado en state.get('thread'): thread_uj69L9Tm8MhKM7TT4S8tuLNX
+
+[19/05/25 22:03:16.027] [INFO] PROCESS_MSG [573003913251]: Thread ID (thread_uj69L9Tm8MhKM7TT4S8tuLNX) guardado/actualizado para cliente 573003913251.
+
+[19/05/25 22:03:16.028] [INFO] PROCESS_MSG [573003913251]: Respuesta de OpenAI recibida: "Hola, ¿cómo puedo ayudarte hoy? 😊..."
+
+[19/05/25 22:03:16.029] [INFO] PROCESS_MSG [573003913251]: Enviando chunk: "Hola, ¿cómo puedo ayudarte hoy? 😊..."
+
+[19/05/25 22:03:16.755] [DEBUG] MESSAGES_UPSERT: Evento recibido: tipo_evento=append, mensajes=1
+
+[19/05/25 22:03:16.756] [DEBUG] BOT_SELF_MSG_APPEND: Mensaje (type: append) saliente a 573003913251 ignorado (asumido self/bot): "Hola, ¿cómo puedo ayudarte hoy? 😊..."
+
+[19/05/25 22:03:16.908] [INFO] PROCESS_MSG [573003913251]: Todos los chunks enviados para el mensaje original del cliente: "Hila
+
+
+
+Ju
+
+
+
+Ggh
+
+
+
+Ghh..."
+
+[19/05/25 22:03:16.909] [INFO] HANDLE_QUEUE [573003913251]: Tarea completada.
+
+[19/05/25 22:03:16.910] [DEBUG] HANDLE_QUEUE [573003913251]: Bloqueo liberado.
+
+[19/05/25 22:03:16.911] [INFO] HANDLE_QUEUE [573003913251]: Cola vacía y desbloqueada. Limpiada.
+
+[19/05/25 22:03:39.762] [DEBUG] MESSAGES_UPSERT: Evento recibido: tipo_evento=notify, mensajes=1
+
+[19/05/25 22:03:39.768] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Mensaje de cliente "Que tal..." recibido.
+
+[19/05/25 22:03:39.770] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Nuevo buffer de mensajes creado para cliente.
+
+[19/05/25 22:03:39.774] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Mensaje añadido al buffer del cliente. Total en buffer: 1.
+
+[19/05/25 22:03:39.777] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Temporizador de inactividad (6s) iniciado/reiniciado para cliente.
+
+[19/05/25 22:03:42.036] [DEBUG] MESSAGES_UPSERT: Evento recibido: tipo_evento=notify, mensajes=1
+
+[19/05/25 22:03:42.039] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Mensaje de cliente "Como va todo..." recibido.
+
+[19/05/25 22:03:42.042] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Mensaje añadido al buffer del cliente. Total en buffer: 2.
+
+[19/05/25 22:03:42.048] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Temporizador de inactividad (6s) iniciado/reiniciado para cliente.
+
+[19/05/25 22:03:44.430] [DEBUG] MESSAGES_UPSERT: Evento recibido: tipo_evento=notify, mensajes=1
+
+[19/05/25 22:03:44.434] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Mensaje de cliente "Que me cuenta..." recibido.
+
+[19/05/25 22:03:44.436] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Mensaje añadido al buffer del cliente. Total en buffer: 3.
+
+[19/05/25 22:03:44.440] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Temporizador de inactividad (6s) iniciado/reiniciado para cliente.
+
+[19/05/25 22:03:47.485] [DEBUG] MESSAGES_UPSERT: Evento recibido: tipo_evento=notify, mensajes=1
+
+[19/05/25 22:03:47.490] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Mensaje de cliente "Que precios tienen..." recibido.
+
+[19/05/25 22:03:47.491] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Mensaje añadido al buffer del cliente. Total en buffer: 4.
+
+[19/05/25 22:03:47.493] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Temporizador de inactividad (6s) iniciado/reiniciado para cliente.
+
+[19/05/25 22:03:53.494] [INFO] USER_ACTIVITY_TIMEOUT [from:573003913251]: 4 msgs combinados y encolados: "Que tal
+
+
+
+Como va todo
+
+
+
+Que me cuenta
+
+
+
+Que precios tienen..."
+
+[19/05/25 22:03:53.495] [INFO] USER_ACTIVITY_TIMEOUT [from:573003913251]: Cola principal no bloqueada. Iniciando handleQueue.
+
+[19/05/25 22:03:53.497] [DEBUG] HANDLE_QUEUE [573003913251]: Bloqueo adquirido.
+
+[19/05/25 22:03:53.498] [INFO] HANDLE_QUEUE [573003913251]: Procesando tarea. Restantes: 0. Msg: "Que tal
+
+
+
+Como va todo
+
+
+
+Que me cuenta
+
+
+
+Que precios tienen..."
+
+[19/05/25 22:03:53.499] [INFO] PROCESS_MSG [573003913251]: Iniciando procesamiento OpenAI para: "Que tal
+
+
+
+Como va todo
+
+
+
+Que me cuenta
+
+
+
+Que precios tienen..."
+
+[19/05/25 22:03:53.501] [INFO] PROCESS_MSG [573003913251]: Solicitando respuesta a OpenAI Assistant (asst_AZUrB)...
+
+Hola, todo bien, gracias.  
+
+¿Para qué fechas buscas apartamento?  
+
+¿Personas adultas y niños?  
+
+Sobre precios, ya le confirmo en el sistema.
+
+[19/05/25 22:03:57.092] [DEBUG] PROCESS_MSG [573003913251]: Valor de state.get('thread'): thread_uj69L9Tm8MhKM7TT4S8tuLNX
+
+[19/05/25 22:03:57.093] [INFO] PROCESS_MSG [573003913251]: Thread ID encontrado en state.get('thread'): thread_uj69L9Tm8MhKM7TT4S8tuLNX
+
+[19/05/25 22:03:57.094] [DEBUG] PROCESS_MSG [573003913251]: Thread ID (thread_uj69L9Tm8MhKM7TT4S8tuLNX) ya estaba guardado para cliente 573003913251.
+
+[19/05/25 22:03:57.094] [INFO] PROCESS_MSG [573003913251]: Respuesta de OpenAI recibida: "Hola, todo bien, gracias.  
+
+¿Para qué fechas busca..."
+
+[19/05/25 22:03:57.096] [INFO] PROCESS_MSG [573003913251]: Enviando chunk: "Hola, todo bien, gracias.  
+
+¿Para qué fechas busca..."
+
+[19/05/25 22:03:57.420] [DEBUG] MESSAGES_UPSERT: Evento recibido: tipo_evento=append, mensajes=1
+
+[19/05/25 22:03:57.420] [DEBUG] BOT_SELF_MSG_APPEND: Mensaje (type: append) saliente a 573003913251 ignorado (asumido self/bot): "Hola, todo bien, gracias.  
+
+¿Para qué fechas buscas apartame..."
+
+[19/05/25 22:03:57.570] [INFO] PROCESS_MSG [573003913251]: Todos los chunks enviados para el mensaje original del cliente: "Que tal
+
+
+
+Como va todo
+
+
+
+Que me ..."
+
+[19/05/25 22:03:57.571] [INFO] HANDLE_QUEUE [573003913251]: Tarea completada.
+
+[19/05/25 22:03:57.572] [DEBUG] HANDLE_QUEUE [573003913251]: Bloqueo liberado.
+
+[19/05/25 22:03:57.572] [INFO] HANDLE_QUEUE [573003913251]: Cola vacía y desbloqueada. Limpiada.
+
+[19/05/25 22:04:28.676] [DEBUG] MESSAGES_UPSERT: Evento recibido: tipo_evento=notify, mensajes=1
+
+[19/05/25 22:04:28.677] [INFO] MANUAL_MSG_DETECTED [to:573003913251]: Mensaje manual (type: notify) detectado: "Los precios son de 200 la noche..."
+
+[19/05/25 22:04:28.678] [WARN] MANUAL_MSG_NO_THREAD [to:573003913251]: No hay thread_id para 573003913251. Mensaje manual "Los precios son de 200 la noche..." no sincronizado. El cliente debe interactuar primero.
+
+[19/05/25 22:04:45.968] [DEBUG] MESSAGES_UPSERT: Evento recibido: tipo_evento=notify, mensajes=1
+
+[19/05/25 22:04:45.969] [INFO] MANUAL_MSG_DETECTED [to:573003913251]: Mensaje manual (type: notify) detectado: "Y 300 los de 2 alcobas..."
+
+[19/05/25 22:04:45.970] [WARN] MANUAL_MSG_NO_THREAD [to:573003913251]: No hay thread_id para 573003913251. Mensaje manual "Y 300 los de 2 alcobas..." no sincronizado. El cliente debe interactuar primero.
+
+[19/05/25 22:04:58.030] [DEBUG] MESSAGES_UPSERT: Evento recibido: tipo_evento=notify, mensajes=1
+
+[19/05/25 22:04:58.031] [INFO] MANUAL_MSG_DETECTED [to:573003913251]: Mensaje manual (type: notify) detectado: "Estos precios los di manual..."
+
+[19/05/25 22:04:58.032] [WARN] MANUAL_MSG_NO_THREAD [to:573003913251]: No hay thread_id para 573003913251. Mensaje manual "Estos precios los di manual..." no sincronizado. El cliente debe interactuar primero.
+
+[19/05/25 22:05:09.343] [DEBUG] MESSAGES_UPSERT: Evento recibido: tipo_evento=notify, mensajes=1
+
+[19/05/25 22:05:09.346] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Mensaje de cliente "Ah gracias me repites los prec..." recibido.
+
+[19/05/25 22:05:09.348] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Nuevo buffer de mensajes creado para cliente.
+
+[19/05/25 22:05:09.348] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Mensaje añadido al buffer del cliente. Total en buffer: 1.
+
+[19/05/25 22:05:09.349] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Temporizador de inactividad (6s) iniciado/reiniciado para cliente.
+
+[19/05/25 22:05:15.350] [INFO] USER_ACTIVITY_TIMEOUT [from:573003913251]: 1 msgs combinados y encolados: "Ah gracias me repites los precios?..."
+
+[19/05/25 22:05:15.352] [INFO] USER_ACTIVITY_TIMEOUT [from:573003913251]: Cola principal no bloqueada. Iniciando handleQueue.
+
+[19/05/25 22:05:15.356] [DEBUG] HANDLE_QUEUE [573003913251]: Bloqueo adquirido.
+
+[19/05/25 22:05:15.361] [INFO] HANDLE_QUEUE [573003913251]: Procesando tarea. Restantes: 0. Msg: "Ah gracias me repites los precios?..."
+
+[19/05/25 22:05:15.365] [INFO] PROCESS_MSG [573003913251]: Iniciando procesamiento OpenAI para: "Ah gracias me repites los precios?..."
+
+[19/05/25 22:05:15.372] [INFO] PROCESS_MSG [573003913251]: Solicitando respuesta a OpenAI Assistant (asst_AZUrB)...
+
+Espere, ya le confirmo en el sistema los precios.
+
+[19/05/25 22:05:20.786] [DEBUG] PROCESS_MSG [573003913251]: Valor de state.get('thread'): thread_uj69L9Tm8MhKM7TT4S8tuLNX
+
+[19/05/25 22:05:20.787] [INFO] PROCESS_MSG [573003913251]: Thread ID encontrado en state.get('thread'): thread_uj69L9Tm8MhKM7TT4S8tuLNX
+
+[19/05/25 22:05:20.787] [DEBUG] PROCESS_MSG [573003913251]: Thread ID (thread_uj69L9Tm8MhKM7TT4S8tuLNX) ya estaba guardado para cliente 573003913251.
+
+[19/05/25 22:05:20.788] [INFO] PROCESS_MSG [573003913251]: Respuesta de OpenAI recibida: "Espere, ya le confirmo en el sistema los precios...."
+
+[19/05/25 22:05:20.789] [INFO] PROCESS_MSG [573003913251]: Enviando chunk: "Espere, ya le confirmo en el sistema los precios...."
+
+[19/05/25 22:05:21.127] [DEBUG] MESSAGES_UPSERT: Evento recibido: tipo_evento=append, mensajes=1
+
+[19/05/25 22:05:21.128] [DEBUG] BOT_SELF_MSG_APPEND: Mensaje (type: append) saliente a 573003913251 ignorado (asumido self/bot): "Espere, ya le confirmo en el sistema los precios...."
+
+[19/05/25 22:05:21.277] [INFO] PROCESS_MSG [573003913251]: Todos los chunks enviados para el mensaje original del cliente: "Ah gracias me repites los prec..."
+
+[19/05/25 22:05:21.278] [INFO] HANDLE_QUEUE [573003913251]: Tarea completada.
+
+[19/05/25 22:05:21.279] [DEBUG] HANDLE_QUEUE [573003913251]: Bloqueo liberado.
+
+[19/05/25 22:05:21.280] [INFO] HANDLE_QUEUE [573003913251]: Cola vacía y desbloqueada. Limpiada.
+
+[19/05/25 22:06:12.488] [DEBUG] MESSAGES_UPSERT: Evento recibido: tipo_evento=notify, mensajes=1
+
+[19/05/25 22:06:12.490] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Mensaje de cliente "Me los repite..." recibido.
+
+[19/05/25 22:06:12.491] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Nuevo buffer de mensajes creado para cliente.
+
+[19/05/25 22:06:12.493] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Mensaje añadido al buffer del cliente. Total en buffer: 1.
+
+[19/05/25 22:06:12.494] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Temporizador de inactividad (6s) iniciado/reiniciado para cliente.
+
+[19/05/25 22:06:13.330] [DEBUG] MESSAGES_UPSERT: Evento recibido: tipo_evento=notify, mensajes=1
+
+[19/05/25 22:06:13.335] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Mensaje de cliente "?..." recibido.
+
+[19/05/25 22:06:13.338] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Mensaje añadido al buffer del cliente. Total en buffer: 2.
+
+[19/05/25 22:06:13.341] [INFO] CLIENT_MSG_HANDLER [from:573003913251]: Temporizador de inactividad (6s) iniciado/reiniciado para cliente.
+
+[19/05/25 22:06:19.343] [INFO] USER_ACTIVITY_TIMEOUT [from:573003913251]: 2 msgs combinados y encolados: "Me los repite
+
+
+
+?..."
+
+[19/05/25 22:06:19.344] [INFO] USER_ACTIVITY_TIMEOUT [from:573003913251]: Cola principal no bloqueada. Iniciando handleQueue.
+
+[19/05/25 22:06:19.346] [DEBUG] HANDLE_QUEUE [573003913251]: Bloqueo adquirido.
+
+[19/05/25 22:06:19.347] [INFO] HANDLE_QUEUE [573003913251]: Procesando tarea. Restantes: 0. Msg: "Me los repite
+
+
+
+?..."
+
+[19/05/25 22:06:19.352] [INFO] PROCESS_MSG [573003913251]: Iniciando procesamiento OpenAI para: "Me los repite
+
+
+
+?..."
+
+[19/05/25 22:06:19.357] [INFO] PROCESS_MSG [573003913251]: Solicitando respuesta a OpenAI Assistant (asst_AZUrB)...
+
+Permita, me comunico con encargado para confirmarle.
+
+[19/05/25 22:06:27.581] [DEBUG] PROCESS_MSG [573003913251]: Valor de state.get('thread'): thread_uj69L9Tm8MhKM7TT4S8tuLNX
+
+[19/05/25 22:06:27.582] [INFO] PROCESS_MSG [573003913251]: Thread ID encontrado en state.get('thread'): thread_uj69L9Tm8MhKM7TT4S8tuLNX
+
+[19/05/25 22:06:27.584] [DEBUG] PROCESS_MSG [573003913251]: Thread ID (thread_uj69L9Tm8MhKM7TT4S8tuLNX) ya estaba guardado para cliente 573003913251.
+
+[19/05/25 22:06:27.585] [INFO] PROCESS_MSG [573003913251]: Respuesta de OpenAI recibida: "Permita, me comunico con encargado para confirmarl..."
+
+[19/05/25 22:06:27.586] [INFO] PROCESS_MSG [573003913251]: Enviando chunk: "Permita, me comunico con encargado para confirmarl..."
+
+[19/05/25 22:06:27.919] [DEBUG] MESSAGES_UPSERT: Evento recibido: tipo_evento=append, mensajes=1
+
+[19/05/25 22:06:27.920] [DEBUG] BOT_SELF_MSG_APPEND: Mensaje (type: append) saliente a 573003913251 ignorado (asumido self/bot): "Permita, me comunico con encargado para confirmarle...."
+
+[19/05/25 22:06:28.069] [INFO] PROCESS_MSG [573003913251]: Todos los chunks enviados para el mensaje original del cliente: "Me los repite
+
+
+
+?..."
+
+[19/05/25 22:06:28.070] [INFO] HANDLE_QUEUE [573003913251]: Tarea completada.
+
+[19/05/25 22:06:28.071] [DEBUG] HANDLE_QUEUE [573003913251]: Bloqueo liberado.
+
+[19/05/25 22:06:28.072] [INFO] HANDLE_QUEUE [573003913251]: Cola vacía y desbloqueada. Limpiada.
+
+
+
+---
+
+
+
+el rento que tengo es que los mensajes manuales 
+
+
+
+[19/05/25 22:04:28.677] [INFO] MANUAL_MSG_DETECTED [to:573003913251]: Mensaje manual (type: notify) detectado: "Los precios son de 200 la noche..."
+
+
+
+--- como estes
+
+
+
+despues que el cliente responda 
+
+
+
+se envia a open ai para que genere la respuesta
+
+
+
+primero Los mensajes manuales + la respuesta del cliente a ese mensaje manual
+
+
+
+para que open ai responda con conexto a lo que se le envio en ese mensaje manual
+
+
+
+ya que el alla tiene memoria actualmente solo de los mensajes que recibe de mi aplicacion bot
+
+
+
+entiendes?
+
+
+
+que propones, que soluciones propones
+
+
+
+ademas analiza la ejecucion de la terminal creo que hay un error con respecto al flujo de los 6 segundos
+
+
+
+la idea de eso, es que si un cliente escribe, sperar 6 segundos para agrupar todo lo que escribe en una sola solicitud para open ai, 
+
+
+
+verificalo, auditalo, y define los flujos y posibles soluciones, del resto no cambies mas nada porque se estropea mi app, ah aqui te paso el codigo anteiror que no incluia los mensajes manuales y creo q mejoraba mejor lo de flujo de los 6 segundos
+
+
+
+entonces tengo dos retos, 1 mejorar el flujo de los 6 segundos, (verifica si ya esta hecho) y lo de los mensajes manuales para q tambien sean enviados a open ai
+
+
+
+import "dotenv/config"
+
+import OpenAI from 'openai'; // Para interactuar directamente con API de OpenAI
+
+import { createBot, createProvider, createFlow, addKeyword, EVENTS } from '@builderbot/bot'
+
+import { MemoryDB } from '@builderbot/bot'
+
+import { BaileysProvider } from '@builderbot/provider-baileys'
+
+import { toAsk, httpInject } from "@builderbot-plugins/openai-assistants"
+
+
+
+// --- Constantes ---
+
+const PORT = process.env.PORT ?? 3008;
+
+const ASSISTANT_ID = process.env.ASSISTANT_ID ?? '';
+
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY ?? ''; // Necesaria para el SDK
+
+
+
+const CHUNK_DELAY_MS = 150;
+
+const OPENAI_COOLDOWN_MS = 3000;
+
+const CLEAN_REGEX = /【.*?】[ ]?/g;
+
+const USER_INACTIVITY_TIMEOUT_MS = 6000; // Ajustado a 6 segundos
+
+const ENCARGADO_SYNC_PREFIX = "[SYNC]";
+
+const OPENAI_THREAD_ID_KEY = 'thread_id'; // Clave para el thread_id en el state (confirmar si es esta)
+
+
+
+// --- SDK de OpenAI ---
+
+let openai: OpenAI;
+
+if (OPENAI_API_KEY) {
+
+    openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+
+} else {
+
+    // Este console.error se mostrará antes que los customLog si OPENAI_API_KEY falta al inicio
+
+    console.error("CRITICAL_ENV_ERROR: OPENAI_API_KEY no está configurada en el archivo .env. La funcionalidad de sincronización de mensajes de encargado y OpenAI no operará.");
+
+    // Considerar salir si es crítico: process.exit(1);
+
+}
+
+
+
+// --- Almacenamiento para colas y bloqueos ---
+
+const userQueues = new Map<string, Array<any>>();
+
+const userLocks = new Map<string, boolean>();
+
+
+
+interface UserMessageBuffer {
+
+    messages: string[];
+
+    lastCtx: any;
+
+    flowDynamic: any;
+
+    state: any; 
+
+    provider: any;
+
+}
+
+const userMessageBuffers = new Map<string, UserMessageBuffer>();
+
+const userActivityTimers = new Map<string, NodeJS.Timeout>();
+
+
+
+// --- Funciones de Logging Personalizadas ---
+
+const getFormattedTimestamp = (): string => {
+
+    const now = new Date();
+
+    const dateOptions: Intl.DateTimeFormatOptions = { year: '2-digit', month: '2-digit', day: '2-digit' };
+
+    const timeOptions: Intl.DateTimeFormatOptions = { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false };
+
+    const date = now.toLocaleDateString('es-CO', dateOptions);
+
+    const time = now.toLocaleTimeString('es-CO', timeOptions);
+
+    const ms = String(now.getMilliseconds()).padStart(3, '0');
+
+    return `${date} ${time}.${ms}`;
+
+};
+
+
+
+const customLog = (level: 'INFO' | 'WARN' | 'ERROR' | 'DEBUG', context: string, ...messages: any[]) => {
+
+    const timestamp = getFormattedTimestamp();
+
+    const messageParts = messages.map(msg => {
+
+        if (msg instanceof Error) return msg.stack || msg.message;
+
+        if (typeof msg === 'object' && msg !== null) {
+
+            try { return JSON.stringify(msg, null, 2); } catch (e) { return '[Objeto no serializable]'; }
+
+        }
+
+        return String(msg);
+
+    });
+
+    const logLine = `[${timestamp}] [${level}] ${context}: ${messageParts.join(' ')}`;
+
+    switch (level) {
+
+        case 'INFO': console.log(logLine); break;
+
+        case 'WARN': console.warn(logLine); break;
+
+        case 'ERROR': console.error(logLine); break;
+
+        case 'DEBUG': console.debug(logLine); break; // Añadido para logs de depuración
+
+    }
+
+};
+
+
+
+// --- Funciones de Ayuda ---
+
+const getShortUserId = (ctxOrUserId: any): string => {
+
+    if (typeof ctxOrUserId === 'string') return ctxOrUserId.split('@')[0] || ctxOrUserId;
+
+    return ctxOrUserId?.from?.split('@')[0] || ctxOrUserId?.from || ctxOrUserId?.key?.remoteJid?.split('@')[0] || 'unknownUser';
+
+};
+
+
+
+const extractTextFromMessage = (msg: any): string | null => {
+
+    if (!msg || !msg.message) return null;
+
+    return msg.message.conversation ||
+
+           msg.message.extendedTextMessage?.text ||
+
+           msg.message.ephemeralMessage?.message?.extendedTextMessage?.text ||
+
+           msg.message.ephemeralMessage?.message?.conversation ||
+
+           null;
+
+};
+
+
+
+// --- Función de Typing ---
+
+const typing = async (ctx: any, provider: any): Promise<void> => {
+
+    const remoteJid = ctx.key?.remoteJid;
+
+    const shortUserId = getShortUserId(ctx.from || ctx.key.remoteJid); // ctx.from para entrantes, ctx.key.remoteJid para salientes
+
+    const logContext = `TYPING [${shortUserId}]`;
+
+
+
+    if (provider?.vendor?.sendPresenceUpdate && typeof provider.vendor.sendPresenceUpdate === 'function') {
+
+        if (remoteJid) {
+
+            try {
+
+                await provider.vendor.sendPresenceUpdate('composing', remoteJid);
+
+            } catch (e) {
+
+                customLog('ERROR', logContext, `Error al enviar 'composing':`, e);
+
+            }
+
+        } else {
+
+            // No siempre es un error, podría ser un mensaje sin remoteJid claro en ese contexto.
+
+            // customLog('WARN', logContext, `ctx.key.remoteJid no disponible.`);
+
+        }
+
+    }
+
+};
+
+
+
+/**
+
+ * Procesa el mensaje del usuario interactuando con OpenAI y enviando la respuesta.
+
+ */
+
+const processUserMessage = async (ctx: any, { flowDynamic, state, provider }: any) => {
+
+    const shortUserId = getShortUserId(ctx.from);
+
+    const logContext = `PROCESS_MSG [${shortUserId}]`;
+
+    let mensajeParaOpenAI = ctx.body;
+
+
+
+    const esperandoEncargado = await state.get('esperando_respuesta_encargado');
+
+    if (esperandoEncargado) {
+
+        const temaConsulta = await state.get('tema_consulta_encargado') || 'un tema previo';
+
+        const notaContextual = `[Nota para el Asistente: El usuario podría estar respondiendo a información proporcionada manualmente por un encargado sobre "${temaConsulta}". Por favor, ten esto en cuenta al generar tu respuesta.]\n\n`;
+
+        mensajeParaOpenAI = notaContextual + ctx.body;
+
+        customLog('INFO', logContext, `Añadiendo nota contextual para OpenAI sobre "${temaConsulta}".`);
+
+        await state.update({ esperando_respuesta_encargado: false, tema_consulta_encargado: null });
+
+    }
+
+
+
+    customLog('INFO', logContext, `Iniciando procesamiento OpenAI para: "${mensajeParaOpenAI.substring(0,100)}..."`);
+
+    await typing(ctx, provider);
+
+
+
+    customLog('INFO', logContext, `Solicitando respuesta a OpenAI Assistant (${ASSISTANT_ID.substring(0,10)})...`);
+
+    const response = await toAsk(ASSISTANT_ID, mensajeParaOpenAI, state);
+
+    customLog('INFO', logContext, `Respuesta de OpenAI recibida: "${response.substring(0,50)}..."`);
+
+
+
+    const chunks = response.split(/\n\n+/);
+
+    for (const chunk of chunks) {
+
+        const cleanedChunk = chunk.trim().replace(CLEAN_REGEX, "");
+
+        if (cleanedChunk) {
+
+            customLog('INFO', logContext, `Enviando chunk: "${cleanedChunk.substring(0, 50)}..."`);
+
+            await flowDynamic([{ body: cleanedChunk }]);
+
+            
+
+            if (cleanedChunk.toLowerCase().includes("espere, me comunico con el encargado") || 
+
+                cleanedChunk.toLowerCase().includes("confirmo con encargado") ||
+
+                cleanedChunk.toLowerCase().includes("confirmo los precios en el sistema y le aviso")) {
+
+                let tema = "información general";
+
+                const originalUserQuery = ctx.body; 
+
+                if (originalUserQuery.toLowerCase().includes("precio")) tema = "precios";
+
+                if (originalUserQuery.toLowerCase().includes("disponibilidad")) tema = "disponibilidad";
+
+                if (originalUserQuery.toLowerCase().includes("ubicado") || originalUserQuery.toLowerCase().includes("distancia")) tema = "ubicación";
+
+                
+
+                await state.update({ esperando_respuesta_encargado: true, tema_consulta_encargado: tema });
+
+                customLog('INFO', logContext, `Bot indicó comunicación con encargado sobre tema "${tema}". Estado 'esperando_respuesta_encargado' activado para ${shortUserId}.`);
+
+            }
+
+            await new Promise(resolve => setTimeout(resolve, CHUNK_DELAY_MS));
+
+        }
+
+    }
+
+    customLog('INFO', logContext, `Todos los chunks enviados para el mensaje original del cliente: "${ctx.body.substring(0,30)}..."`);
+
+};
+
+
+
+// --- Manejo de Cola (handleQueue) ---
+
+const handleQueue = async (userId: string) => {
+
+    const queue = userQueues.get(userId);
+
+    const shortUserId = getShortUserId(userId);
+
+    const logContext = `HANDLE_QUEUE [${shortUserId}]`;
+
+
+
+    if (!queue) {
+
+        customLog('INFO', logContext, `No se encontró cola.`);
+
+        userLocks.delete(userId);
+
+        return;
+
+    }
+
+    
+
+    if (userLocks.get(userId)) {
+
+        customLog('INFO', logContext, `La cola está bloqueada.`);
+
+        return;
+
+    }
+
+
+
+    while (queue.length > 0) {
+
+        if (userLocks.get(userId)) {
+
+            customLog('INFO', logContext, `Bloqueo activado en bucle.`);
+
+            return;
+
+        }
+
+        userLocks.set(userId, true);
+
+        customLog('INFO', logContext, `Bloqueo adquirido.`);
+
+        const task = queue.shift();
+
+
+
+        if (task) {
+
+            const { ctx, flowDynamic, state, provider } = task; 
+
+            customLog('INFO', logContext, `Procesando tarea. Restantes: ${queue.length}. Msg: "${String(ctx.body).substring(0,100)}..."`);
+
+            try {
+
+                await processUserMessage(ctx, { flowDynamic, state, provider });
+
+                customLog('INFO', logContext, `Tarea completada.`);
+
+            } catch (error: any) {
+
+                const errorMessage = error.message || String(error);
+
+                customLog('ERROR', logContext, `Error en tarea para msg "${String(ctx.body).substring(0,30)}...":`, error);
+
+                if (errorMessage.includes("while a run") && errorMessage.includes("is active")) {
+
+                    customLog('ERROR', logContext, `OpenAI Run activo. Cooldown actual: ${OPENAI_COOLDOWN_MS}ms.`);
+
+                }
+
+            } finally {
+
+                userLocks.set(userId, false);
+
+                customLog('INFO', logContext, `Bloqueo liberado.`);
+
+                if (queue.length > 0) {
+
+                    customLog('INFO', logContext, `${queue.length} en cola. Cooldown ${OPENAI_COOLDOWN_MS}ms.`);
+
+                    await new Promise(resolve => setTimeout(resolve, OPENAI_COOLDOWN_MS));
+
+                }
+
+            }
+
+        } else {
+
+            userLocks.set(userId, false);
+
+            customLog('WARN', logContext, `Bloqueo liberado (tarea nula).`);
+
+            break; 
+
+        }
+
+    }
+
+
+
+    if (queue.length === 0 && !userLocks.get(userId)) {
+
+        userQueues.delete(userId);
+
+        userLocks.delete(userId);
+
+        customLog('INFO', logContext, `Cola vacía y desbloqueada. Limpiada.`);
+
+    } else if (queue.length === 0 && userLocks.get(userId)) {
+
+        customLog('WARN', logContext, `Cola vacía pero aún bloqueada.`);
+
+    } else if (queue.length > 0 && !userLocks.get(userId)) {
+
+        customLog('INFO', logContext, `${queue.length} en cola y desbloqueada. Siguiente handleQueue lo tomará.`);
+
+    }
+
+};
+
+
+
+// --- Flujo Principal ---
+
+const mainFlow = addKeyword<BaileysProvider, MemoryDB>(EVENTS.WELCOME)
+
+    .addAction(async (ctx, args) => {
+
+        if (ctx.key.fromMe) {
+
+            // customLog('DEBUG', `MAIN_FLOW [from:${getShortUserId(ctx.from)}]`, `Mensaje 'fromMe:true' detectado en mainFlow (EVENTS.WELCOME). Ignorando, ya que debe ser manejado por 'messages.upsert' si es del encargado, o es un eco del propio bot.`);
+
+            return;
+
+        }
+
+
+
+        const { flowDynamic, state, provider } = args;
+
+        const clientId = ctx.from;
+
+        const shortClientId = getShortUserId(clientId);
+
+        const currentMessageBody = ctx.body;
+
+        const logContextClient = `CLIENT_MSG_HANDLER [from:${shortClientId}]`;
+
+
+
+        customLog('INFO', logContextClient, `Mensaje de cliente "${currentMessageBody.substring(0,30)}..." recibido.`);
+
+
+
+        let userBuffer = userMessageBuffers.get(clientId);
+
+        if (!userBuffer) {
+
+            userBuffer = { messages: [], lastCtx: ctx, flowDynamic, state, provider };
+
+            userMessageBuffers.set(clientId, userBuffer);
+
+            customLog('INFO', logContextClient, `Nuevo buffer de mensajes creado para cliente.`);
+
+        }
+
+        
+
+        userBuffer.messages.push(currentMessageBody);
+
+        userBuffer.lastCtx = ctx;
+
+        userBuffer.flowDynamic = flowDynamic;
+
+        userBuffer.state = state; 
+
+        userBuffer.provider = provider;
+
+
+
+        customLog('INFO', logContextClient, `Mensaje añadido al buffer del cliente. Total en buffer: ${userBuffer.messages.length}.`);
+
+
+
+        if (userActivityTimers.has(clientId)) {
+
+            clearTimeout(userActivityTimers.get(clientId)!);
+
+        }
+
+
+
+        const timerId = setTimeout(async () => {
+
+            const finalBuffer = userMessageBuffers.get(clientId);
+
+            if (finalBuffer && finalBuffer.messages.length > 0) {
+
+                const combinedMessageBody = finalBuffer.messages.join('\n\n');
+
+                const taskCtx = { ...finalBuffer.lastCtx, body: combinedMessageBody };
+
+                const taskState = finalBuffer.state;
+
+
+
+                if (!userQueues.has(clientId)) {
+
+                    userQueues.set(clientId, []);
+
+                }
+
+                const queue = userQueues.get(clientId)!;
+
+                queue.push({ 
+
+                    ctx: taskCtx, 
+
+                    flowDynamic: finalBuffer.flowDynamic, 
+
+                    state: taskState, 
+
+                    provider: finalBuffer.provider 
+
+                });
+
+                customLog('INFO', `USER_ACTIVITY_TIMEOUT [from:${shortClientId}]`, `${finalBuffer.messages.length} msgs combinados y encolados: "${combinedMessageBody.substring(0,100)}..."`);
+
+
+
+                if (!userLocks.get(clientId)) {
+
+                    customLog('INFO', `USER_ACTIVITY_TIMEOUT [from:${shortClientId}]`, `Cola principal no bloqueada. Iniciando handleQueue.`);
+
+                    handleQueue(clientId);
+
+                } else {
+
+                    customLog('INFO', `USER_ACTIVITY_TIMEOUT [from:${shortClientId}]`, `Cola principal bloqueada. Msg combinado esperará.`);
+
+                }
+
+            }
+
+            userMessageBuffers.delete(clientId);
+
+            userActivityTimers.delete(clientId);
+
+        }, USER_INACTIVITY_TIMEOUT_MS);
+
+
+
+        userActivityTimers.set(clientId, timerId);
+
+        customLog('INFO', logContextClient, `Temporizador de inactividad (${USER_INACTIVITY_TIMEOUT_MS / 1000}s) iniciado/reiniciado para cliente.`);
+
+    });
+
+
+
+// --- Función Principal (main) ---
+
+const main = async () => {
+
+    const logContext = `[MAIN_INIT]`;
+
+    customLog('INFO', logContext, `Iniciando el bot en el puerto ${PORT}`);
+
+    if (!ASSISTANT_ID) {
+
+        customLog('ERROR', logContext, `CRITICAL: La variable de entorno ASSISTANT_ID no está configurada. Saliendo.`);
+
+        process.exit(1);
+
+    }
+
+    if (!OPENAI_API_KEY || !openai) { // Chequeo si el SDK de OpenAI se pudo inicializar
+
+        customLog('ERROR', logContext, `CRITICAL: OPENAI_API_KEY no configurada o SDK de OpenAI no inicializado. Sincronización de encargado no funcionará. Saliendo.`);
+
+        process.exit(1); // Salir si es crítico
+
+    }
+
+    customLog('INFO', logContext, `Usando Assistant ID: ${ASSISTANT_ID.substring(0,10)}...`);
+
+    customLog('INFO', logContext, `OpenAI Cooldown: ${OPENAI_COOLDOWN_MS}ms.`);
+
+    customLog('INFO', logContext, `User Inactivity Timeout (Msg Grouping): ${USER_INACTIVITY_TIMEOUT_MS}ms.`);
+
+    customLog('INFO', logContext, `Encargado Sync Prefix: "${ENCARGADO_SYNC_PREFIX}"`);
+
+
+
+    const adapterFlow = createFlow([mainFlow]);
+
+    const baseAdapterProvider = createProvider(BaileysProvider, { groupsIgnore: true, readStatus: false });
+
+    const adapterDB = new MemoryDB(); 
+
+
+
+    const { httpServer, provider } = await createBot({
+
+        flow: adapterFlow,
+
+        provider: baseAdapterProvider,
+
+        database: adapterDB,
+
+    });
+
+
+
+    // Listener para 'messages.upsert' usando la instancia 'provider' de createBot
+
+    if (provider?.vendor?.ev && openai) {
+
+        customLog('INFO', logContext, "Preparando suscripción a 'connection.update' del proveedor Baileys.");
+
+        
+
+        provider.vendor.ev.on('connection.update', async (update: any) => {
+
+            const { connection } = update;
+
+            const connLogContext = `${logContext} [Baileys Connection]`;
+
+            if (connection === 'open') {
+
+                customLog('INFO', connLogContext, "Conexión abierta. Suscribiéndose ahora a 'messages.upsert'.");
+
+
+
+                provider.vendor.ev.removeAllListeners('messages.upsert'); // Prevenir duplicados en reconexión
+
+                provider.vendor.ev.on('messages.upsert', async ({ messages, type }) => {
+
+                    const upsertLogContext = `MESSAGES_UPSERT_HANDLER`;
+
+                    // customLog('DEBUG', upsertLogContext, `Evento: ${type}, Mensajes: ${messages.length}`);
+
+
+
+                    for (const msg of messages) {
+
+                        if (!msg.message || msg.key.remoteJid === 'status@broadcast') continue;
+
+                        const messageBody = extractTextFromMessage(msg);
+
+
+
+                        if (msg.key.fromMe && messageBody) {
+
+                            const recipientJid = msg.key.remoteJid;
+
+                            const shortRecipientJid = getShortUserId(recipientJid);
+
+                            const currentMsgContext = `${upsertLogContext} [to:${shortRecipientJid}]`;
+
+
+
+                            customLog('DEBUG', currentMsgContext, `Mensaje 'fromMe' detectado. Body: "${messageBody.substring(0, 60)}..."`);
+
+
+
+                            if (messageBody.startsWith(ENCARGADO_SYNC_PREFIX)) {
+
+                                customLog('INFO', currentMsgContext, `Prefijo SYNC de encargado detectado.`);
+
+                                const encargadoMessageContent = messageBody.substring(ENCARGADO_SYNC_PREFIX.length).trim();
+
+                                
+
+                                if (!encargadoMessageContent) {
+
+                                    customLog('WARN', currentMsgContext, `Mensaje SYNC del encargado está vacío.`);
+
+                                    continue;
+
+                                }
+
+                                try {
+
+                                    const clientStateObject = await adapterDB.get(recipientJid);
+
+                                    if (!clientStateObject || typeof clientStateObject !== 'object') {
+
+                                        customLog('WARN', currentMsgContext, `No se encontró estado o no es un objeto para cliente ${shortRecipientJid}. No se puede sincronizar.`);
+
+                                        continue;
+
+                                    }
+
+                                    const threadId = clientStateObject[OPENAI_THREAD_ID_KEY];
+
+                                    if (!threadId) {
+
+                                        customLog('WARN', currentMsgContext, `No se encontró thread_id (key: ${OPENAI_THREAD_ID_KEY}) en estado de ${shortRecipientJid}.`);
+
+                                        continue;
+
+                                    }
+
+                                    customLog('INFO', currentMsgContext, `Añadiendo mensaje de encargado al thread ${threadId}: "${encargadoMessageContent.substring(0,50)}"`);
+
+                                    await openai.beta.threads.messages.create(threadId, {
+
+                                        role: 'assistant', 
+
+                                        content: encargadoMessageContent
+
+                                    });
+
+                                    customLog('INFO', currentMsgContext, `Mensaje de encargado sincronizado con OpenAI para ${shortRecipientJid}.`);
+
+                                } catch (e: any) {
+
+                                    customLog('ERROR', currentMsgContext, `Error sincronizando mensaje de encargado para ${shortRecipientJid}:`, e.message, e.stack);
+
+                                }
+
+                            }
+
+                        }
+
+                    }
+
+                });
+
+            } else if (connection === 'close') {
+
+                 customLog('WARN', connLogContext, "Conexión cerrada.");
+
+            }
+
+        });
+
+    } else {
+
+        let reason = "";
+
+        if (!openai) reason += "SDK de OpenAI no inicializado. ";
+
+        if (!provider?.vendor?.ev) reason += "provider.vendor.ev no disponible. ";
+
+        customLog('WARN', logContext, `No se puede configurar listener para 'messages.upsert'. Razón: ${reason.trim()}`);
+
+    }
+
+
+
+    // httpInject ahora usa 'baseAdapterProvider' porque 'provider.server' podría no ser el servidor HTTP que espera httpInject.
+
+    // Generalmente, el httpInject se aplica al servidor que Baileys/Venom crea, que está en la instancia original.
+
+    if (baseAdapterProvider.server && typeof httpInject === 'function') {
+
+        httpInject(baseAdapterProvider.server);
+
+        customLog('INFO', logContext, `Inyección HTTP para el proveedor aplicada.`);
+
+    } else {
+
+        customLog('WARN', logContext, `No se pudo aplicar inyección HTTP al proveedor (baseAdapterProvider.server no disponible o httpInject no es función).`);
+
+    }
+
+
+
+    if (httpServer && typeof httpServer === 'function') {
+
+        httpServer(Number(PORT));
+
+        customLog('INFO', logContext, `Llamada a httpServer(${PORT}) realizada.`);
+
+    } else {
+
+        customLog('ERROR', logContext, `httpServer no es una función o no se obtuvo.`);
+
+    }
+
+};
+
+
+
+main().catch(err => {
+
+    customLog('ERROR', `[MAIN_INIT]`, `Error fatal al iniciar bot:`, err);
+
+    process.exit(1);
+
+});
+
+
+
+---
+
+
+
+
+
+creo que quizas lo mas facil es tomar este codigo antiguo y solo incluirle la parte de los mensajes manuales, para ya luego trabajar sobre el segundo reto, de que los mensajes manuales sean enviados a open ai
+
+RETO 1.0 Y 1.1 RESUELTO INFORME:
+
+# Informe: Resolución de Desafíos en la Integración de WhatsApp con OpenAI Assistants
+
+## Resumen Ejecutivo
+
+Hemos implementado con éxito un sistema de bot de WhatsApp integrado con OpenAI Assistants que resuelve varios desafíos críticos, principalmente el problema de sincronización de mensajes manuales con el contexto de conversación de OpenAI. Los logs demuestran que el sistema ahora mantiene correctamente el contexto entre mensajes automáticos y manuales, como se evidencia en la conversación donde el asistente recuerda y responde correctamente sobre los precios mencionados manualmente por un operador.
+
+## Desafíos Superados
+
+### 1. Sincronización de Mensajes Manuales
+
+#### Problema Original
+El sistema original no podía vincular correctamente los mensajes enviados manualmente por un operador con el hilo de conversación en OpenAI, causando que el asistente perdiera contexto:
+
+```
+[19/05/25 23:27:55.656] [INFO] PROCESS_MSG [573003913251]: Thread ID guardado: thread_yPJXA83OqL0yF8KRhyVDMKdc
+...
+[19/05/25 23:28:59.491] [INFO] MANUAL_DETECT [573003913251]: Mensaje manual detectado: "Hola soy la entrada manual..."
+[19/05/25 23:28:59.492] [WARN] MANUAL_DETECT [573003913251]: No hay thread_id. El cliente debe interactuar primero.
+```
+
+#### Solución Implementada
+Se implementó un sistema simple pero efectivo para rastrear y relacionar los `thread_id` de OpenAI con los números de teléfono de los clientes:
+
+```javascript
+// Mapa simple en memoria para almacenar thread_ids por número de cliente
+const clientThreadMap = {};
+
+// Función para guardar thread_id en el mapa
+const saveThreadId = (jid, threadId) => {
+    if (!jid || !threadId) return false;
+    
+    const clientPhone = getShortUserId(jid);
+    clientThreadMap[clientPhone] = threadId;
+    
+    log('THREAD_SAVE', 'INFO', `Thread ID ${threadId} guardado para ${clientPhone}`);
+    return true;
+};
+
+// Función para obtener thread_id del mapa
+const getThreadId = (jid) => {
+    if (!jid) return null;
+    
+    const clientPhone = getShortUserId(jid);
+    return clientThreadMap[clientPhone] || null;
+};
+```
+
+La clave fue normalizar el formato del JID (ID de WhatsApp) usando la función `getShortUserId()`, que extrae solo el número de teléfono (ej. "573003913251") tanto al guardar como al recuperar. Esto asegura que el sistema pueda encontrar el thread_id correcto independientemente del contexto.
+
+### 2. Corrección del Envío de Mensajes Manuales a OpenAI
+
+#### Problema Original
+Los mensajes manuales se enviaban a OpenAI de forma incorrecta, lo que rompía el flujo de conversación:
+
+```javascript
+// Versión original problemática
+const result = await openai.beta.threads.messages.create(threadId, {
+    role: 'assistant',
+    content: `(Mensaje manual enviado al cliente): ${messageContent}`
+});
+```
+
+#### Solución Mejorada
+Se implementó un enfoque que mantiene el patrón de conversación alternado entre usuario y asistente, enviando primero un mensaje de sistema con rol 'user' seguido del mensaje del operador con rol 'assistant':
+
+```javascript
+// Enviar una anotación como mensaje de usuario 
+await openai.beta.threads.messages.create(threadId, {
+    role: 'user',
+    content: `[NOTA DEL SISTEMA: Un operador humano ha respondido directamente al cliente con el siguiente mensaje]`
+});
+
+// Luego enviar el mensaje manual como respuesta del asistente
+const result = await openai.beta.threads.messages.create(threadId, {
+    role: 'assistant',
+    content: messageContent
+});
+```
+
+Los logs confirman que esta solución ha funcionado:
+```
+[20/05/25 24:26:24.830] [INFO] PROCESS_MSG [573003913251]: Solicitando respuesta a OpenAI Assistant...
+El primero cuesta 400 mil, el de 3 habitaciones 500 mil.
+```
+
+### 3. Implementación del Buffer de Agrupación de Mensajes
+
+Para mejorar la experiencia de usuario, implementamos un sistema de agrupación de mensajes con un tiempo de inactividad de 6 segundos:
+
+```javascript
+// Gestionar buffer de mensajes para agruparlos
+if (!userMessageBuffers.has(clientId)) {
+    userMessageBuffers.set(clientId, {
+        messages: [],
+        lastCtx: ctx,
+        flowDynamic,
+        state,
+        provider
+    });
+    log(`CLIENT_MSG [${shortClientId}]`, 'INFO', `Nuevo buffer creado`);
+}
+
+const userBuffer = userMessageBuffers.get(clientId);
+userBuffer.messages.push(currentMessageBody);
+// ...
+
+// Establecer nuevo temporizador
+const timerId = setTimeout(async () => {
+    // Procesar mensajes agrupados después de 6 segundos de inactividad
+    // ...
+}, USER_INACTIVITY_TIMEOUT_MS);
+```
+
+Esto permite agrupar mensajes rápidos del mismo cliente antes de procesarlos, evitando múltiples llamadas a OpenAI y proporcionando un contexto más completo.
+
+### 4. Sistema de Logging con Timestamp Preciso
+
+Se implementó un sistema de registro detallado que incluye fecha, hora y milisegundos precisos:
+
+```javascript
+const getFormattedTimestamp = () => {
+    const now = new Date();
+    const dateOptions = { year: '2-digit', month: '2-digit', day: '2-digit' };
+    const timeOptions = { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false };
+    const date = now.toLocaleDateString('es-CO', dateOptions);
+    const time = now.toLocaleTimeString('es-CO', timeOptions);
+    const ms = String(now.getMilliseconds()).padStart(3, '0');
+    return `${date} ${time}.${ms}`;
+};
+
+const log = (context, level, message) => {
+    const timestamp = getFormattedTimestamp();
+    const logLine = `[${timestamp}] [${level}] ${context}: ${message}`;
+    // ...
+};
+```
+
+Este formato facilita el seguimiento exacto del flujo de conversación y la depuración de problemas.
+
+### 5. Detección de Mensajes Manuales
+
+Se implementó un sistema para detectar cuando un operador envía un mensaje manual:
+
+```javascript
+provider.vendor.ev.on('messages.upsert', async ({ messages, type }) => {
+    // ...
+    for (const msg of messages) {
+        // ...
+        // Detectar mensajes manuales (enviados por el operador)
+        if (msg.key.fromMe === true && type !== 'append') {
+            const jid = msg.key.remoteJid;
+            const shortJid = getShortUserId(jid);
+            
+            log(`MANUAL_DETECT [${shortJid}]`, 'INFO', 
+                `Mensaje manual detectado: "${messageBody.substring(0,50)}..."`);
+            
+            // Verificar el thread_id usando la función getThreadId
+            const threadId = getThreadId(jid);
+            
+            if (threadId) {
+                log(`MANUAL_DETECT [${shortJid}]`, 'INFO', 
+                    `Thread ID encontrado: ${threadId}`);
+                handleManualMessage(jid, messageBody);
+            } else {
+                log(`MANUAL_DETECT [${shortJid}]`, 'WARN', 
+                    `No hay thread_id para este cliente. El cliente debe interactuar primero.`);
+            }
+        }
+    }
+});
+```
+
+### 6. Agrupación de Mensajes Manuales
+
+Similar al buffer para mensajes de usuarios, implementamos un sistema para agrupar mensajes manuales enviados en ráfagas:
+
+```javascript
+function handleManualMessage(jid, messageBody) {
+    // ...
+    const buffer = manualMessageBuffers.get(jid);
+    buffer.push(messageBody);
+    
+    // ...
+    
+    const timerId = setTimeout(async () => {
+        const messages = manualMessageBuffers.get(jid);
+        if (messages && messages.length > 0) {
+            const combinedMessage = messages.join('\n\n');
+            // ...
+            await syncManualMessageToOpenAI(jid, combinedMessage);
+        }
+        // ...
+    }, MANUAL_INACTIVITY_TIMEOUT_MS);
+    
+    manualActivityTimers.set(jid, timerId);
+}
+```
+
+## Resultados Verificados
+
+Como se puede observar en los logs, el sistema ahora funciona correctamente:
+
+1. El cliente pregunta sobre precios
+2. La IA responde que verificará
+3. El operador envía manualmente "De 400 mil"
+4. Cuando el cliente pregunta "De cuánto dijiste?", la IA responde con el precio correcto
+5. Más adelante, el operador envía "500 mil pesos" para el apartamento de 3 habitaciones
+6. Al final, cuando el cliente pregunta por los precios de ambos, la IA recuerda correctamente ambos valores: "El primero cuesta 400 mil, el de 3 habitaciones 500 mil."
+
+## Plan para el Próximo Reto: Persistencia de Datos a Largo Plazo
+
+### Objetivo
+Implementar un sistema de base de datos persistente que permita:
+1. Guardar el historial de conversaciones vinculadas a números de teléfono
+2. Recuperar conversaciones anteriores de clientes que vuelven después de meses o años
+3. Proporcionar contexto mejorado para interacciones futuras
+
+### Propuesta de Solución
+
+#### 1. Migración a Base de Datos Persistente
+
+```javascript
+// Reemplazar el mapa en memoria con una solución de base de datos
+// Opciones recomendadas:
+// 1. MongoDB para flexibilidad de esquema
+// 2. PostgreSQL/MySQL para transacciones y relaciones
+// 3. Firebase para fácil implementación en la nube
+
+// Modelo de datos sugerido:
+/*
+Colección/Tabla: ClientThreads
+{
+  phoneNumber: "573003913251",  // Clave primaria
+  threadId: "thread_0QjH07vfuppYtNju6ceepeFD",
+  lastActivity: Date,
+  conversationSummary: String,  // Resumen generado para contexto
+  metadata: {
+    // Información adicional como nombre, preferencias, etc.
+  }
+}
+
+Colección/Tabla: ConversationHistory
+{
+  phoneNumber: "573003913251",
+  timestamp: Date,
+  role: "user" | "assistant" | "manual_operator",
+  content: String,
+  threadId: "thread_0QjH07vfuppYtNju6ceepeFD"
+}
+*/
+```
+
+#### 2. Integración con Base de Datos Histórica de Clientes
+
+```javascript
+// Al iniciar conversación con un cliente:
+async function handleReturningCustomer(phoneNumber) {
+  // Verificar si es un cliente recurrente
+  const clientData = await db.ClientThreads.findOne({ phoneNumber });
+  
+  if (clientData) {
+    // Cliente recurrente
+    // Recuperar información histórica relevante
+    const previousInteractions = await db.ConversationHistory
+      .find({ phoneNumber })
+      .sort({ timestamp: -1 })
+      .limit(10);
+    
+    // Crear un resumen para proporcionar contexto a OpenAI
+    const contextSummary = `Cliente recurrente. Última conversación: ${clientData.lastActivity}. 
+    Resumen previo: ${clientData.conversationSummary}`;
+    
+    // Añadir contexto al iniciar nueva conversación con OpenAI
+    return contextSummary;
+  }
+  
+  return null; // Cliente nuevo
+}
+```
+
+#### 3. Generación de Resúmenes de Conversación
+
+```javascript
+// Al finalizar una conversación o después de cierta inactividad
+async function generateConversationSummary(phoneNumber, threadId) {
+  // Recuperar mensajes de esta conversación
+  const messages = await db.ConversationHistory
+    .find({ phoneNumber, threadId })
+    .sort({ timestamp: 1 });
+  
+  // Solicitar a OpenAI que genere un resumen
+  const messageContent = messages.map(m => `${m.role}: ${m.content}`).join('\n');
+  
+  const summary = await openai.createChatCompletion({
+    model: "gpt-4",
+    messages: [
+      {
+        role: "system", 
+        content: "Genera un resumen conciso (máximo 200 palabras) de esta conversación, incluyendo puntos clave como temas discutidos, preferencias del cliente, y cualquier compromiso adquirido."
+      },
+      { role: "user", content: messageContent }
+    ]
+  });
+  
+  // Guardar el resumen
+  await db.ClientThreads.updateOne(
+    { phoneNumber },
+    { 
+      $set: { 
+        conversationSummary: summary.choices[0].message.content,
+        lastActivity: new Date()
+      }
+    }
+  );
+}
+```
+
+#### 4. Interfaz para Operadores Humanos
+
+```javascript
+// Proporcionar a los operadores acceso a la información histórica
+async function getCustomerProfile(phoneNumber) {
+  // Recuperar información del cliente
+  const clientData = await db.ClientThreads.findOne({ phoneNumber });
+  
+  if (!clientData) return { isNew: true };
+  
+  // Recuperar las últimas N conversaciones
+  const recentConversations = await db.ConversationHistory
+    .find({ phoneNumber })
+    .sort({ timestamp: -1 })
+    .limit(100);
+  
+  // Estadísticas de interacción
+  const stats = {
+    totalConversations: await db.ConversationHistory.countDocuments({ 
+      phoneNumber, 
+      role: "user",
+      content: { $regex: /^(?!\[NOTA DEL SISTEMA)/ } // Excluir notas del sistema
+    }),
+    firstInteraction: await db.ConversationHistory
+      .findOne({ phoneNumber })
+      .sort({ timestamp: 1 })
+      .then(doc => doc?.timestamp),
+    frequentTopics: await analyzeFrequentTopics(recentConversations)
+  };
+  
+  return {
+    isNew: false,
+    profile: clientData,
+    stats,
+    recentConversations
+  };
+}
+```
+
+### Beneficios Esperados
+
+1. **Continuidad en las Interacciones**: Los clientes sentirán que la empresa "recuerda" sus interacciones previas
+2. **Personalización Mejorada**: Saludos personalizados basados en historial (ej. "¡Bienvenido de nuevo! ¿Cómo resultó su hospedaje anterior?")
+3. **Mayor Eficiencia Operativa**: Los operadores tendrán acceso inmediato al contexto histórico
+4. **Análisis de Datos**: Posibilidad de analizar tendencias, preferencias y patrones de comunicación
+
+### Próximos Pasos
+
+1. Seleccionar la tecnología de base de datos más adecuada
+2. Diseñar el esquema de datos definitivo
+3. Implementar las funciones de persistencia y recuperación
+4. Crear scripts de migración desde el sistema actual
+5. Desarrollar la interfaz para operadores humanos
+6. Implementar pruebas automatizadas para verificar la integridad
+
+Con esta implementación, el sistema podrá mantener y utilizar el contexto histórico de las conversaciones a largo plazo, llevando la experiencia del cliente a un nivel significativamente superior.
+
+
+
+
